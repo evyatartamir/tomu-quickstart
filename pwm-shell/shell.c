@@ -381,10 +381,14 @@ void hard_fault_handler(void)
 
 void timer2_isr(void)
 {
+	#define USB_PUTS_DELAY_USEC 5000
+	#define TIMER1_TOP_CCV 100
+	#define CCV_INCREMENT 10
+
 	static unsigned int heartbeat_count = 0;	
 	char message_buf[8];
 
-	// Clear interrupt flag
+	// Clear overflow interrupt flag
 	TIMER2_IFC = TIMER_IFC_OF;
 
 	++heartbeat_count;
@@ -403,19 +407,43 @@ void timer2_isr(void)
 		num_to_convert /= 10;
     }
 
-	//TODO: Consecutive calls to usb_puts are rarely performed
-	//TODO: More often than not, only the first call is executed
+	//TODO: Consecutive calls to usb_puts are rarely executed correctly.
+	//TODO: More often than not, only the first call is executed.
 	//TODO: Requires a delay, to allow the USB driver to finish writing to the endpoint, see HID keyboard example.
-	//TODO: Test delay values, can I go below 10,000 usec?
+	//TODO: Test delay values, how low can I go?
 	//TODO: Wrap usb_puts with a function that add a delay?
 
 	usb_puts("\r\nHeartbeat counter: ");
-	udelay_busy(10000);
+	udelay_busy(USB_PUTS_DELAY_USEC);
 	usb_puts(message_buf);
-	udelay_busy(10000);
+	udelay_busy(USB_PUTS_DELAY_USEC);
 	usb_puts("\r\nMy value.. ");
-	udelay_busy(10000);
+	udelay_busy(USB_PUTS_DELAY_USEC);
 	usb_puts(my_itoa_buf);
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	
+	// TODO: Testing toggle TIMER1 PWM compare value
+	// Using the buffered version for CCV to avoid glitches.
+	// Timer will wait until a PWM period is completed before setting the new compare value.
+	static int direction = 1;
+	usb_puts("\r\nRED LED Direction: ");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+	if (direction > 0) {
+		usb_puts("UP");
+	} else {
+		usb_puts("DOWN");
+	}
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	TIMER1_CC0_CCVB = TIMER1_CC0_CCV + direction*CCV_INCREMENT;
+	if (TIMER1_CC0_CCVB >= TIMER1_TOP_CCV) {
+		TIMER1_CC0_CCVB = TIMER1_TOP_CCV;
+		direction = -1;
+	} else if ((int32_t) (TIMER1_CC0_CCVB) <= 0) {
+		TIMER1_CC0_CCVB = 0;
+		direction = 1;
+	}
 }
 
 static void setup_timer2(void)
@@ -426,7 +454,7 @@ static void setup_timer2(void)
 	timer_set_clock_prescaler(TIMER2, TIMER_CTRL_PRESC_DIV1024);	
 	// Top value of 24000, for div 1024, for 24 MHz clock is 1 Hz
 	// So 48000 is once every 2 seconds
-	timer_set_top(TIMER2, 48000); //TODO: Not magic number
+	timer_set_top(TIMER2, 48000); //TODO: Don't use magic number
     
     TIMER2_IEN = TIMER_IEN_OF;
     TIMER2_CNT = 0;
@@ -434,10 +462,54 @@ static void setup_timer2(void)
     // Enable TIMER2 interrupt
     nvic_enable_irq(NVIC_TIMER2_IRQ);
 
-
 	timer_start(TIMER2);
 }
 
+void timer1_isr(void)
+{
+	// Clear overflow interrupt flag
+	TIMER1_IFC = TIMER_IFC_OF;
+
+}
+
+static void setup_timer1(void)
+{
+	cmu_periph_clock_enable(CMU_TIMER1);
+
+	// Initialize TIMER1
+	// Frequency will be (24MHz/prescaler/top_value).
+	// TODO: Should it be less? Frequecny is still > 200 Hz, should it be <= 1KHz? Research.
+	timer_set_clock_prescaler(TIMER1, TIMER_CTRL_PRESC_DIV512);
+	
+	// PWM top value
+	timer_set_top(TIMER1, 100); //TODO: Don't use magic number
+    
+	// PWM compare value
+	TIMER1_CC0_CCV = 50;
+
+    TIMER1_IEN = TIMER_IEN_OF; // Interrupt enable: Overflow
+    TIMER1_CNT = 0; // Initial counter value
+
+	TIMER1_CC0_CTRL	|= TIMER_CC_CTRL_OUTINV; // Invert the output, our LEDs are active-low
+	TIMER1_CC0_CTRL |= TIMER_CC_CTRL_MODE(TIMER_CC_CTRL_MODE_PWM);	
+
+	// Set TIM1_CC0 output to Red LED GPIO's location
+	// RED LED GPIO = PB7, TIM1_CC0 LOCATION #3
+	TIMER1_ROUTE |= TIMER_ROUTE_LOCATION_LOCx(TIMER_ROUTE_LOCATION_LOC3);
+	TIMER1_ROUTE |= TIMER_ROUTE_CC0PEN; // Enable output CC0 for TIMER1
+
+    // Enable TIMER1 interrupt
+    nvic_enable_irq(NVIC_TIMER1_IRQ);
+
+	timer_start(TIMER1);
+}
+
+static void setup_timer0(void)
+{
+	cmu_periph_clock_enable(CMU_TIMER0);
+
+	// GREEN LED GPIO = PA0, TIM0_CC1 LOCATION #6, TIM0_CC0 LOC #0/1/4
+}
 
 int main(void)
 {
@@ -465,10 +537,10 @@ int main(void)
 	while (! (CMU_STATUS & CMU_STATUS_USHFRCODIV2SEL))
 		;
 
-	/* Enable USB IRQs */
+	// Enable USB IRQs
 	nvic_enable_irq(NVIC_USB_IRQ);
 
-
+	setup_timer1();
 	setup_timer2();
 
 	while (1) {

@@ -1,0 +1,18 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/libopencm3/include/libopencm3/efm32/hg/**",
+                "${workspaceFolder}/libopencm3/include/libopencm3/efm32/common/**",
+                "${workspaceFolder}/**"
+            ],
+            "defines": ["EFM32HG"],
+            "compilerPath": "/usr/bin/arm-none-eabi-gcc",
+            "cStandard": "gnu17",
+            "cppStandard": "gnu++14",
+            "intelliSenseMode": "gcc-arm"
+        }
+    ],
+    "version": 4
+}
