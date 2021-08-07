@@ -323,52 +323,6 @@ static void usb_puts(char *s)
 	}
 }
 
-static void opticspy_gpio_set_value(bool is_on)
-{
-	// Note that the LEDs use inverted logic.
-	if (is_on)
-		gpio_clear(LED_RED_PORT, LED_RED_PIN);
-	else
-		gpio_set(LED_RED_PORT, LED_RED_PIN);
-}
-
-static void opticspy_putc(char c)
-{
-	int i;
-
-	// Start bit
-	opticspy_gpio_set_value(1);
-	udelay_busy(BIT_TIME_US);
-
-	// Data bits
-	for (i = 0; i < 8; ++i)
-	{
-		opticspy_gpio_set_value(!((c >> i) & 1));
-		udelay_busy(BIT_TIME_US);
-	}
-
-	// Stop bit
-	opticspy_gpio_set_value(0);
-	udelay_busy(BIT_TIME_US);
-}
-
-static void opticspy_puts(uint8_t *s)
-{
-	int i;
-
-	// If there is no message, turn the LED off and return.
-	if (!s[0]) {
-		opticspy_gpio_set_value(0);
-		return;
-	}
-
-	for (i = 0; s[i] != '\0'; ++i)
-		opticspy_putc(s[i]);
-	opticspy_putc('\r');
-	opticspy_putc('\n');
-	udelay_busy(5000);
-}
-
 void usb_isr(void)
 {
 	usbd_poll(g_usbd_dev);
@@ -487,8 +441,11 @@ static void setup_timer1(void)
 	// PWM compare value
 	TIMER1_CC0_CCV = 50;
 
+	TIMER1_CNT = 0; // Initial counter value
+
+	// TODO: Is this interrupt needed? Maybe to perform PWM duty cycle changes?
     TIMER1_IEN = TIMER_IEN_OF; // Interrupt enable: Overflow
-    TIMER1_CNT = 0; // Initial counter value
+    
 
 	TIMER1_CC0_CTRL	|= TIMER_CC_CTRL_OUTINV; // Invert the output, our LEDs are active-low
 	TIMER1_CC0_CTRL |= TIMER_CC_CTRL_MODE(TIMER_CC_CTRL_MODE_PWM);	
@@ -544,8 +501,8 @@ int main(void)
 	setup_timer2();
 
 	while (1) {
-		// Send the current secret message out the serial port.
-		opticspy_puts(g_secret_message);
+
+		// Process command here? g_secret_message
 
 		if (line_was_connected != g_usbd_is_connected) {
 			if (g_usbd_is_connected) {
