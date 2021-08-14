@@ -28,9 +28,10 @@
 // Make this program compatible with Toboot-V2.0
 #include <toboot.h>
 TOBOOT_CONFIGURATION(0);
+//TOBOOT_CONFIGURATION(TOBOOT_CONFIG_FLAG_AUTORUN); // Uncomment to boot directly to this app, instead of the DFU bootloader.
 
 // Serial prompt
-#define PROMPT          "MSG> "
+#define PROMPT          "CMD> "
 
 #define LED_GREEN_PORT  GPIOA
 #define LED_GREEN_PIN   GPIO0
@@ -39,14 +40,25 @@ TOBOOT_CONFIGURATION(0);
 
 #define VENDOR_ID       0x1209  // pid.code
 #define PRODUCT_ID      0x70b1  // Assigned to Tomu project
-#define DEVICE_VER      0x0101  // Program version
+#define DEVICE_VER      0x0BEB  // Program version
 
 #define BAUD_RATE       19200
-
 #define BIT_TIME_US     (1000000/BAUD_RATE)    // Bit time in uS
 
+#define USB_PUTS_DELAY_USEC 5000
 
-#define TIMER_PWM_TOP_CCV 100
+#define TIMER_INPUT_CLOCK_FREQUENCY 24000000
+#define LED_PWM_TIMER_TOP_CCV 100
+#define LED_PWM_TIMER_PRESCALER TIMER_CTRL_PRESC_DIV16 // TODO: Is this a good value? Should I decrease for accuracy?
+#define LED_PWM_TIMER_CYCLES_PER_SECOND ((LED_PWM_TIMER_TOP_CCV + 1) * (1 << LED_PWM_TIMER_PRESCALER))
+#define LED_PWM_TIMER_CYCLES_PER_MILLISECOND (uint32_t) ((((float) TIMER_INPUT_CLOCK_FREQUENCY / LED_PWM_TIMER_CYCLES_PER_SECOND) + 500) / 1000)
+
+#define CMD_GREEN_LED_FLAG 'G'
+#define CMD_RED_LED_FLAG 'R'
+#define CMD_DEBUG_PRINTS_FLAG 'D'
+#define CMD_SERIAL_ECHO_FLAG 'E'
+
+#define LED_TEST_MODE_MAX 4
 
 enum led_fade_phase {
 	LED_PHASE_LOW = 0,
@@ -65,6 +77,7 @@ struct led_pwm_cfg
 	// Brightness percentage values, 0-100.
 	uint8_t min_brightness;
 	uint8_t max_brightness;
+	// Current fade cycle phase
 	enum led_fade_phase current_phase;
 };
 
@@ -74,8 +87,11 @@ static volatile bool g_usbd_is_connected = false;
 static usbd_device *g_usbd_dev = 0;
 static uint8_t g_current_command[1024];
 static uint8_t g_new_secret_message[1024];
-static volatile uint32_t g_new_secret_message_len;
+static volatile uint32_t g_new_command_len;
 static volatile bool g_should_use_new_command;
+static volatile bool g_debug_prints_enabled = true;
+static volatile bool g_serial_echo_enabled = true;
+static volatile bool g_green_counters_reset = false;
 
 static const struct usb_device_descriptor dev =
 {
@@ -301,7 +317,7 @@ static void cdcacm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 			// For backspace characters, go back one space, print a 'space' to overwrite
 			// the character, then move the cursor back by one.
 			else if ((buf[i] == 0x7f) || (buf[i] == '\b')) {
-				if (g_new_secret_message_len > 0) {
+				if (g_new_command_len > 0) {
 					output[new_len++] = '\b';
 					if (new_len >= sizeof(output))
 						new_len--;
@@ -311,19 +327,21 @@ static void cdcacm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 					output[new_len++] = '\b';
 					if (new_len >= sizeof(output))
 						new_len--;
-					g_new_secret_message[--g_new_secret_message_len] = '\0';
+					g_new_secret_message[--g_new_command_len] = '\0';
 				}
 				continue;
 			}
 			// For printable characters, put them in the new-message buffer.
 			else if (isprint(buf[i])) {
-				g_new_secret_message[g_new_secret_message_len++] = buf[i];
+				g_new_secret_message[g_new_command_len++] = buf[i];
 				output[new_len++] = buf[i];
 				if (new_len >= sizeof(output))
 					new_len--;
 			}
 		}
-		usbd_ep_write_packet(usbd_dev, 0x82, output, new_len);
+		if (g_serial_echo_enabled) {
+			usbd_ep_write_packet(usbd_dev, 0x82, output, new_len);
+		}
 		output[new_len] = 0;
 	}
 }
@@ -362,7 +380,6 @@ void hard_fault_handler(void)
 
 void timer2_isr(void)
 {
-	#define USB_PUTS_DELAY_USEC 5000
 	#define CCV_INCREMENT 10
 
 	static unsigned int heartbeat_count = 0;	
@@ -372,13 +389,12 @@ void timer2_isr(void)
 	TIMER2_IFC = TIMER_IFC_OF;
 
 	++heartbeat_count;
-
 	itoa(heartbeat_count, message_buf, 10);
 
+/*
 	char my_itoa_buf[8] = "0000000";
 	//my_itoa_buf[7] = '\0';	
 	int current_index = 6;
-	//unsigned int num_to_convert = heartbeat_count;
 	unsigned int num_to_convert = 9102349;
 
     while ((num_to_convert) && (current_index >= 0)) {	    
@@ -386,6 +402,7 @@ void timer2_isr(void)
 		--current_index;
 		num_to_convert /= 10;
     }
+*/
 
 	//TODO: Consecutive calls to usb_puts are rarely executed correctly.
 	//TODO: More often than not, only the first call is executed.
@@ -397,11 +414,13 @@ void timer2_isr(void)
 	udelay_busy(USB_PUTS_DELAY_USEC);
 	usb_puts(message_buf);
 	udelay_busy(USB_PUTS_DELAY_USEC);
+
+/*
 	usb_puts("\r\nMy value.. ");
 	udelay_busy(USB_PUTS_DELAY_USEC);
 	usb_puts(my_itoa_buf);
 	udelay_busy(USB_PUTS_DELAY_USEC);
-
+*/
 	
 	// TODO: Testing toggle TIMER1 PWM compare value
 	// Using the buffered version for CCV to avoid glitches.
@@ -417,8 +436,8 @@ void timer2_isr(void)
 	udelay_busy(USB_PUTS_DELAY_USEC);
 
 	TIMER1_CC0_CCVB = TIMER1_CC0_CCV + direction*CCV_INCREMENT;
-	if (TIMER1_CC0_CCVB >= TIMER_PWM_TOP_CCV) {
-		TIMER1_CC0_CCVB = TIMER_PWM_TOP_CCV;
+	if (TIMER1_CC0_CCVB >= LED_PWM_TIMER_TOP_CCV) {
+		TIMER1_CC0_CCVB = LED_PWM_TIMER_TOP_CCV;
 		direction = -1;
 	} else if ((int32_t) (TIMER1_CC0_CCVB) <= 0) {
 		TIMER1_CC0_CCVB = 0;
@@ -461,7 +480,7 @@ static void setup_timer1(void)
 	// TODO: Should it be less? Frequecny is still > 200 Hz, should it be <= 1KHz? Research.
 	timer_set_clock_prescaler(TIMER1, TIMER_CTRL_PRESC_DIV512);
 	
-	timer_set_top(TIMER1, TIMER_PWM_TOP_CCV);
+	timer_set_top(TIMER1, LED_PWM_TIMER_TOP_CCV);
     
 	TIMER1_CC0_CCV = 50; // PWM compare value
 	TIMER1_CNT = 0; // Initial counter value
@@ -490,50 +509,59 @@ void timer0_isr(void)
 	static timer_cycles = 0;
 	static cycle_millis = 0;
 
+	if (g_green_counters_reset) {
+		g_green_counters_reset = false;
+		timer_cycles = 0;
+		cycle_millis = 0;
+	}
+
 	++timer_cycles;
 
-	// TODO: Don't use magic numbers, for test only.
-	// TODO: At least replace 15 with a macro, an arithmetic expression of other macros.
-	// For 24MHz, 16 prescaler, top value 100, every ~15 cycles is a milliseconds.
-
-	if (!(timer_cycles % 15)) {
+	if (!(timer_cycles % LED_PWM_TIMER_CYCLES_PER_MILLISECOND)) {
 		++cycle_millis;
 		timer_cycles = 0;
 	}
 
 	// TODO: refactor all of this into a function, for reuse with Red LED?
 
-	uint8_t brightness_delta = g_green_led_cfg.max_brightness - g_green_led_cfg.min_brightness;
+	struct led_pwm_cfg* led_cfg = &g_green_led_cfg;
+	uint8_t brightness_delta = led_cfg->max_brightness - led_cfg->min_brightness;
 
-	switch (g_green_led_cfg.current_phase) {
+	switch (led_cfg->current_phase) {
 		case LED_PHASE_LOW:
-			if (cycle_millis >= g_green_led_cfg.low_duration_ms) {
-				g_green_led_cfg.current_phase = LED_PHASE_RAMP_UP;
+			if (cycle_millis >= led_cfg->low_duration_ms) {
+				led_cfg->current_phase = LED_PHASE_RAMP_UP;
 				cycle_millis = 0;				
+			} else {
+				// Not necessary, but smooths the transition when setting the current phase from outside this function.
+				TIMER0_CC0_CCVB = led_cfg->min_brightness;
 			}
 		break;
 		case LED_PHASE_RAMP_UP:
-			if (cycle_millis >= g_green_led_cfg.ramp_up_ms) {
-				g_green_led_cfg.current_phase = LED_PHASE_HIGH;
-				TIMER0_CC0_CCVB = g_green_led_cfg.max_brightness;
+			if (cycle_millis >= led_cfg->ramp_up_ms) {
+				led_cfg->current_phase = LED_PHASE_HIGH;
+				TIMER0_CC0_CCVB = led_cfg->max_brightness;
 				cycle_millis = 0;
 			} else {
-				TIMER0_CC0_CCVB = g_green_led_cfg.min_brightness + (brightness_delta *  cycle_millis / g_green_led_cfg.ramp_up_ms);
+				TIMER0_CC0_CCVB = led_cfg->min_brightness + (brightness_delta *  cycle_millis / led_cfg->ramp_up_ms);
 			}
 		break;
 		case LED_PHASE_HIGH:
-			if (cycle_millis >= g_green_led_cfg.high_duration_ms) {
-				g_green_led_cfg.current_phase = LED_PHASE_RAMP_DOWN;
+			if (cycle_millis >= led_cfg->high_duration_ms) {
+				led_cfg->current_phase = LED_PHASE_RAMP_DOWN;
 				cycle_millis = 0;
+			} else {
+				// Not necessary, but smooths the transition when setting the current phase from outside this function.
+				TIMER0_CC0_CCVB = led_cfg->max_brightness;
 			}
 		break;
 		case LED_PHASE_RAMP_DOWN:
-			if (cycle_millis >= g_green_led_cfg.ramp_down_ms) {
-				g_green_led_cfg.current_phase = LED_PHASE_LOW;
-				TIMER0_CC0_CCVB = g_green_led_cfg.min_brightness;
+			if (cycle_millis >= led_cfg->ramp_down_ms) {
+				led_cfg->current_phase = LED_PHASE_LOW;
+				TIMER0_CC0_CCVB = led_cfg->min_brightness;
 				cycle_millis = 0;
 			} else {
-				TIMER0_CC0_CCVB = g_green_led_cfg.max_brightness - (brightness_delta *  cycle_millis / g_green_led_cfg.ramp_down_ms);
+				TIMER0_CC0_CCVB = led_cfg->max_brightness - (brightness_delta *  cycle_millis / led_cfg->ramp_down_ms);
 			}
 		break;
 		default: // Should never happen
@@ -546,10 +574,10 @@ void timer0_isr(void)
 static void setup_timer0(void)
 {
 	cmu_periph_clock_enable(CMU_TIMER0);
-	timer_set_clock_prescaler(TIMER0, TIMER_CTRL_PRESC_DIV16); // TODO: Is this a good value?
-	timer_set_top(TIMER0, TIMER_PWM_TOP_CCV);
+	timer_set_clock_prescaler(TIMER0, LED_PWM_TIMER_PRESCALER);
+	timer_set_top(TIMER0, LED_PWM_TIMER_TOP_CCV);
 
-	TIMER0_CC0_CCV = 50; // PWM compare value
+	TIMER0_CC0_CCV = 0; // PWM compare value
 	TIMER0_CNT = 0; // Initial counter value
 
     TIMER0_IEN = TIMER_IEN_OF; // Interrupt enable: Overflow
@@ -567,60 +595,106 @@ static void setup_timer0(void)
 	timer_start(TIMER0);
 }
 
-static void handle_command(uint8_t* cmd_buffer)
+static void set_led_test_mode(struct led_pwm_cfg* led_cfg, uint32_t mode)
 {
-	#define MAX_COMMAND_TEST_MODE 3
-	static uint8_t test_mode = 0;
+	if (led_cfg == NULL) {
+		usb_puts("ERROR LED TEST\r\n");
+		return;
+	}
 
-	usb_puts("Command received\r\n");
-	// TODO: Parse the command.
-	// TODO: A LED configuration should first stop the timer and reset all config values to default, then restart.
-
-	// TODO: Remove this test code
-	switch (test_mode) {
+	switch (mode) {
 		case 0: // LED breathing demo, low power indication
-			g_green_led_cfg.min_brightness = 0;
-			g_green_led_cfg.max_brightness = 100;
-			g_green_led_cfg.low_duration_ms = 4000;
-			g_green_led_cfg.high_duration_ms = 500;
-			g_green_led_cfg.ramp_up_ms = 1000;
-			g_green_led_cfg.ramp_down_ms = 1000; 
+			led_cfg->min_brightness = 0;
+			led_cfg->max_brightness = 100;
+			led_cfg->low_duration_ms = 4000;
+			led_cfg->high_duration_ms = 500;
+			led_cfg->ramp_up_ms = 1000;
+			led_cfg->ramp_down_ms = 1000; 
+			led_cfg->current_phase = LED_PHASE_LOW;
 		break;
 		case 1: // LED blink demo
-			g_green_led_cfg.min_brightness = 0;
-			g_green_led_cfg.max_brightness = 100;
-			g_green_led_cfg.low_duration_ms = 1000;
-			g_green_led_cfg.high_duration_ms = 1000;
-			g_green_led_cfg.ramp_up_ms = 0;
-			g_green_led_cfg.ramp_down_ms = 0; 
+			led_cfg->min_brightness = 0;
+			led_cfg->max_brightness = 100;
+			led_cfg->low_duration_ms = 1000;
+			led_cfg->high_duration_ms = 1000;
+			led_cfg->ramp_up_ms = 0;
+			led_cfg->ramp_down_ms = 0;
+			led_cfg->current_phase = LED_PHASE_LOW;
 		break;
 		case 2: // LED constant ON demo
-			g_green_led_cfg.min_brightness = 100;
-			g_green_led_cfg.max_brightness = 100;
-			g_green_led_cfg.low_duration_ms = 0;
-			g_green_led_cfg.high_duration_ms = 1000;
-			g_green_led_cfg.ramp_up_ms = 0;
-			g_green_led_cfg.ramp_down_ms = 0;
+			led_cfg->min_brightness = 100;
+			led_cfg->max_brightness = 100;
+			led_cfg->low_duration_ms = 0;
+			led_cfg->high_duration_ms = 1000;
+			led_cfg->ramp_up_ms = 0;
+			led_cfg->ramp_down_ms = 0;
+			led_cfg->current_phase = LED_PHASE_HIGH;
 		break;
 		case 3: // LED constant OFF demo
-			g_green_led_cfg.max_brightness = 0;
-			g_green_led_cfg.min_brightness = 0;
-			g_green_led_cfg.low_duration_ms = 1000;
-			g_green_led_cfg.high_duration_ms = 0;
-			g_green_led_cfg.ramp_up_ms = 0;
-			g_green_led_cfg.ramp_down_ms = 0;
+			led_cfg->max_brightness = 0;
+			led_cfg->min_brightness = 0;
+			led_cfg->low_duration_ms = 1000;
+			led_cfg->high_duration_ms = 0;
+			led_cfg->ramp_up_ms = 0;
+			led_cfg->ramp_down_ms = 0;
+			led_cfg->current_phase = LED_PHASE_LOW;
+		break;
+		case 4: // LED symmetric min to max
+			led_cfg->max_brightness = 100;
+			led_cfg->min_brightness = 0;
+			led_cfg->low_duration_ms = 1000;
+			led_cfg->high_duration_ms = 1000;
+			led_cfg->ramp_up_ms = 10000;
+			led_cfg->ramp_down_ms = 10000;
+			led_cfg->current_phase = LED_PHASE_LOW;
 		break;
 		default:
 			usb_puts("ERROR CMD TEST\r\n");
+			return;
 		break;
 	}
 
-	if (test_mode >= MAX_COMMAND_TEST_MODE) {
+	if (g_debug_prints_enabled) {
+		char message_buf[4];
+		usb_puts("\r\nSet test mode: ");
+		udelay_busy(USB_PUTS_DELAY_USEC);
+		itoa(mode, message_buf, 10);
+		usb_puts(message_buf);
+	}
+}
+
+static void handle_command(uint8_t* cmd_buffer)
+{
+	static uint8_t test_mode = 0;
+
+/* // TODO: Remove this
+	if (g_debug_prints_enabled) {
+		usb_puts("Command received\r\n");
+		udelay_busy(USB_PUTS_DELAY_USEC);
+	}
+*/
+	// TODO: Parse the command.
+	// TODO: Add function to parse LED config and return success/failure
+	// TODO: G MIN_% MAX_% LOW_MS RAMPUP_MS HIGH_MS RAMPDOWN_MS R MIN_% …
+	// TODO: Add function to pase a flag (input 0/1) and return flag value or failure
+	// TODO: Or maybe send the address of the bool to set, and have the function handle everything?
+	// TODO: D1 D0 E1 E0
+
+	// LED configuration should stop the timer, then set config values, then start timer.
+	timer_stop(TIMER0);
+	TIMER0_CNT = 0;
+
+	// TODO: Remove this test mode in final version?
+	set_led_test_mode(&g_green_led_cfg, test_mode);
+	g_green_counters_reset = true;
+
+	timer_start(TIMER0);
+
+	if (test_mode >= LED_TEST_MODE_MAX) {
 		test_mode = 0;
 	} else {
 		++test_mode;
 	}
-
 }
 
 int main(void)
@@ -653,14 +727,10 @@ int main(void)
 	// Enable USB IRQs
 	nvic_enable_irq(NVIC_USB_IRQ);
 
+	// TODO: Should probably leave all values initialized to 0, and have the Timer as Off by default.
+
 	// Initialize Green LED fade values
-	g_green_led_cfg.min_brightness = 0;
-	g_green_led_cfg.max_brightness = 100;
-	g_green_led_cfg.low_duration_ms = 1000;
-	g_green_led_cfg.high_duration_ms = 2000;
-	g_green_led_cfg.ramp_up_ms = 3000;
-	g_green_led_cfg.ramp_down_ms = 3000;
-	g_green_led_cfg.current_phase = LED_PHASE_LOW;
+	set_led_test_mode(&g_green_led_cfg, 0); 
 
 	setup_timer0();
 	setup_timer1();
@@ -685,16 +755,16 @@ int main(void)
 			memset(g_current_command, 0, sizeof(g_current_command));
 
 			// Print a different message depending on whether the new message is blank.
-			if (g_new_secret_message_len) {
-				memcpy(g_current_command, g_new_secret_message, g_new_secret_message_len);
+			if (g_new_command_len) {
+				memcpy(g_current_command, g_new_secret_message, g_new_command_len);
 				handle_command(g_current_command);
 			}
 			else {
-				usb_puts("Empty command.\r\n" PROMPT);
+				usb_puts("\r\n" PROMPT);
 			}
 
 			g_should_use_new_command = false;
-			g_new_secret_message_len = 0;
+			g_new_command_len = 0;
 		}
 	}
 }
