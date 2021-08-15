@@ -57,8 +57,14 @@ TOBOOT_CONFIGURATION(0);
 #define CMD_RED_LED_FLAG 'R'
 #define CMD_DEBUG_PRINTS_FLAG 'D'
 #define CMD_SERIAL_ECHO_FLAG 'E'
+#define CMD_TEST_MODE 'T'
 
 #define LED_TEST_MODE_MAX 4
+
+enum led_colour {
+	GREEN_LED = 0,
+	RED_LED = 1
+};
 
 enum led_fade_phase {
 	LED_PHASE_LOW = 0,
@@ -86,7 +92,7 @@ struct led_pwm_cfg g_green_led_cfg, g_red_led_cfg;
 static volatile bool g_usbd_is_connected = false;
 static usbd_device *g_usbd_dev = 0;
 static uint8_t g_current_command[1024];
-static uint8_t g_new_secret_message[1024];
+static uint8_t g_new_command[1024];
 static volatile uint32_t g_new_command_len;
 static volatile bool g_should_use_new_command;
 static volatile bool g_debug_prints_enabled = true;
@@ -327,13 +333,13 @@ static void cdcacm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 					output[new_len++] = '\b';
 					if (new_len >= sizeof(output))
 						new_len--;
-					g_new_secret_message[--g_new_command_len] = '\0';
+					g_new_command[--g_new_command_len] = '\0';
 				}
 				continue;
 			}
 			// For printable characters, put them in the new-message buffer.
 			else if (isprint(buf[i])) {
-				g_new_secret_message[g_new_command_len++] = buf[i];
+				g_new_command[g_new_command_len++] = buf[i];
 				output[new_len++] = buf[i];
 				if (new_len >= sizeof(output))
 					new_len--;
@@ -378,6 +384,7 @@ void hard_fault_handler(void)
 	while(1);
 }
 
+// TODO: Remove this timer?
 void timer2_isr(void)
 {
 	#define CCV_INCREMENT 10
@@ -410,11 +417,12 @@ void timer2_isr(void)
 	//TODO: Test delay values, how low can I go?
 	//TODO: Wrap usb_puts with a function that add a delay?
 
-	usb_puts("\r\nHeartbeat counter: ");
-	udelay_busy(USB_PUTS_DELAY_USEC);
-	usb_puts(message_buf);
-	udelay_busy(USB_PUTS_DELAY_USEC);
-
+	if (g_debug_prints_enabled) {
+		usb_puts("\r\nHeartbeat counter: ");
+		udelay_busy(USB_PUTS_DELAY_USEC);
+		usb_puts(message_buf);
+		udelay_busy(USB_PUTS_DELAY_USEC);
+	}
 /*
 	usb_puts("\r\nMy value.. ");
 	udelay_busy(USB_PUTS_DELAY_USEC);
@@ -426,14 +434,17 @@ void timer2_isr(void)
 	// Using the buffered version for CCV to avoid glitches.
 	// Timer will wait until a PWM period is completed before setting the new compare value.
 	static int direction = 1;
-	usb_puts("\r\nRED LED Direction: ");
-	udelay_busy(USB_PUTS_DELAY_USEC);
-	if (direction > 0) {
-		usb_puts("UP");
-	} else {
-		usb_puts("DOWN");
+
+	if (g_debug_prints_enabled) {
+		usb_puts("\r\nRED LED Direction: ");
+		udelay_busy(USB_PUTS_DELAY_USEC);
+		if (direction > 0) {
+			usb_puts("UP");
+		} else {
+			usb_puts("DOWN");
+		}
+		udelay_busy(USB_PUTS_DELAY_USEC);
 	}
-	udelay_busy(USB_PUTS_DELAY_USEC);
 
 	TIMER1_CC0_CCVB = TIMER1_CC0_CCV + direction*CCV_INCREMENT;
 	if (TIMER1_CC0_CCVB >= LED_PWM_TIMER_TOP_CCV) {
@@ -663,9 +674,90 @@ static void set_led_test_mode(struct led_pwm_cfg* led_cfg, uint32_t mode)
 	}
 }
 
-static void handle_command(uint8_t* cmd_buffer)
+static void parse_flag(uint8_t flag, uint8_t param_char)
+{
+	bool* flag_p = NULL;
+
+	switch (flag) {
+	case CMD_DEBUG_PRINTS_FLAG:
+		flag_p = &g_debug_prints_enabled;
+	break;
+	case CMD_SERIAL_ECHO_FLAG:
+		flag_p = &g_serial_echo_enabled;
+	break;
+	default:
+		usb_puts("ERROR FLAG TYPE\r\n"); // Should never happen
+		return;
+	}
+
+	if (flag_p == NULL) { // Should never happen
+		usb_puts("ERROR FLAG POINTER\r\n");
+		return;
+	}
+
+	if (param_char == (uint8_t) '1') {
+		*flag_p = true;
+		return;
+	} else if (param_char == (uint8_t) '0') {
+		*flag_p = false;
+		return;
+	} else {
+		usb_puts("ERROR PARSE FLAG\r\n");
+		return;
+	}
+}
+
+static void handle_command(uint8_t* cmd_buffer, uint32_t buffer_len)
 {
 	static uint8_t test_mode = 0;
+	uint8_t current_flag;
+
+	if ((cmd_buffer == NULL) || (buffer_len == 0)) {
+		return;
+	}
+
+	uint32_t current_char = 0;
+	while (current_char < buffer_len) {
+		switch (toupper(cmd_buffer[current_char])) {
+			case CMD_TEST_MODE:
+
+				// TODO: Move the timer and counters stuff into the set_led_test_mode function
+				// TODO: Maybe implemend helper function to stop/start a timer given led_colour
+				// LED configuration should stop the timer, then set config values, then start timer.
+				timer_stop(TIMER0);
+				TIMER0_CNT = 0;
+
+				// TODO: Generelize into a function which accept enum led_colour, so the function would know which TIMER to restart, etc.
+				set_led_test_mode(&g_green_led_cfg, test_mode);
+				g_green_counters_reset = true;
+
+				timer_start(TIMER0);
+
+				if (test_mode >= LED_TEST_MODE_MAX) {
+					test_mode = 0;
+				} else {
+					++test_mode;
+				}
+			break;
+			case CMD_DEBUG_PRINTS_FLAG:
+			case CMD_SERIAL_ECHO_FLAG:
+				current_flag = (uint8_t) toupper(cmd_buffer[current_char]);
+				++current_char;
+				if (current_char >= buffer_len) {
+					usb_puts("Missing flag param: 0/1\r\n");
+					return; // Don't parse the reset of the input
+				}
+				// TODO: In case of bad flag value, the rest of the command will still be parsed.
+				// TODO: Is this desirable, or should I check a return value for parse_flag()?
+				parse_flag(current_flag, cmd_buffer[current_char]);
+			break;
+			default:
+				usb_puts("ERROR Parsing Command\r\n");
+				return;
+		} // Switch
+
+		++current_char;
+	}
 
 /* // TODO: Remove this
 	if (g_debug_prints_enabled) {
@@ -680,21 +772,7 @@ static void handle_command(uint8_t* cmd_buffer)
 	// TODO: Or maybe send the address of the bool to set, and have the function handle everything?
 	// TODO: D1 D0 E1 E0
 
-	// LED configuration should stop the timer, then set config values, then start timer.
-	timer_stop(TIMER0);
-	TIMER0_CNT = 0;
 
-	// TODO: Remove this test mode in final version?
-	set_led_test_mode(&g_green_led_cfg, test_mode);
-	g_green_counters_reset = true;
-
-	timer_start(TIMER0);
-
-	if (test_mode >= LED_TEST_MODE_MAX) {
-		test_mode = 0;
-	} else {
-		++test_mode;
-	}
 }
 
 int main(void)
@@ -756,8 +834,8 @@ int main(void)
 
 			// Print a different message depending on whether the new message is blank.
 			if (g_new_command_len) {
-				memcpy(g_current_command, g_new_secret_message, g_new_command_len);
-				handle_command(g_current_command);
+				memcpy(g_current_command, g_new_command, g_new_command_len);
+				handle_command(g_current_command, g_new_command_len);
 			}
 			else {
 				usb_puts("\r\n" PROMPT);
