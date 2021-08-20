@@ -45,6 +45,10 @@ TOBOOT_CONFIGURATION(0);
 #define BAUD_RATE       19200
 #define BIT_TIME_US     (1000000/BAUD_RATE)    // Bit time in uS
 
+//TODO: Consecutive calls to usb_puts are rarely executed correctly.
+//TODO: More often than not, only the first call is executed.
+//TODO: Requires a delay, to allow the USB driver to finish writing to the endpoint, see HID keyboard example.
+//TODO: Wrap usb_puts with a function that add a delay?
 #define USB_PUTS_DELAY_USEC 5000
 
 #define TIMER_INPUT_CLOCK_FREQUENCY 24000000
@@ -53,11 +57,35 @@ TOBOOT_CONFIGURATION(0);
 #define LED_PWM_TIMER_CYCLES_PER_SECOND ((LED_PWM_TIMER_TOP_CCV + 1) * (1 << LED_PWM_TIMER_PRESCALER))
 #define LED_PWM_TIMER_CYCLES_PER_MILLISECOND (uint32_t) ((((float) TIMER_INPUT_CLOCK_FREQUENCY / LED_PWM_TIMER_CYCLES_PER_SECOND) + 500) / 1000)
 
-#define CMD_GREEN_LED_FLAG 'G'
-#define CMD_RED_LED_FLAG 'R'
+// Duty cycle percentage
+#define MAX_PWM_VALUE 100
+#define MAX_PWM_VALUE_STRING "100"
+#define MIN_PWM_VALUE 0
+#define MIN_PWM_VALUE_STRING "0"
+
+
+#define CMD_HELP 'H'
+#define CMD_GREEN_LED_CFG 'G'
+#define CMD_RED_LED_CFG 'R'
+#define CMD_SYNC_TIMERS 'S'
 #define CMD_DEBUG_PRINTS_FLAG 'D'
 #define CMD_SERIAL_ECHO_FLAG 'E'
 #define CMD_TEST_MODE 'T'
+
+// Parameters for LED commands
+#define PARAM_TEST_MODE 'T'
+#define PARAM_MAX_PWM 'X'
+#define PARAM_MIN_PWM 'N'
+#define PARAM_LOW_MS 'L'
+#define PARAM_HIGH_MS 'H'
+#define PARAM_RAMPUP_MS 'U'
+#define PARAM_RAMPDOWN_MS 'D'
+#define PARAM_CURRENT_PHASE 'P'
+
+#define PARAM_PHASE_LOW 'L'
+#define PARAM_PHASE_HIGH 'H'
+#define PARAM_PHASE_RAMPUP 'U'
+#define PARAM_PHASE_RAMPDOWN 'D'
 
 #define NUM_LED_PARAMS 7
 #define LED_TEST_MODE_MAX 4
@@ -70,8 +98,8 @@ enum led_colour {
 enum led_fade_phase {
 	LED_PHASE_LOW = 0,
 	LED_PHASE_RAMP_UP = 1,
-	LED_PHASE_RAMP_DOWN = 2,
-	LED_PHASE_HIGH = 3
+	LED_PHASE_HIGH = 2,
+	LED_PHASE_RAMP_DOWN = 3
 };
 
 struct led_pwm_cfg
@@ -337,7 +365,7 @@ static void cdcacm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 				continue;
 			}
 			// For printable characters, put them in the new-message buffer.
-			else if (isprint(buf[i])) {
+			else if (isprint((int) buf[i])) {
 				g_new_command[g_new_command_len++] = buf[i];
 				output[new_len++] = buf[i];
 				if (new_len >= sizeof(output))
@@ -401,12 +429,10 @@ inline static void set_led_timer_ccvb(enum led_colour led, uint32_t value)
 	}
 }
 
-// TODO: Remove this timer?
+// TODO: Remove this timer
 void timer2_isr(void)
 {
-	#define CCV_INCREMENT 10
-
-	static unsigned int heartbeat_count = 0;	
+	static unsigned int heartbeat_count = 0;
 	char message_buf[8];
 
 	// Clear overflow interrupt flag
@@ -415,63 +441,15 @@ void timer2_isr(void)
 	++heartbeat_count;
 	itoa(heartbeat_count, message_buf, 10);
 
-/*
-	char my_itoa_buf[8] = "0000000";
-	//my_itoa_buf[7] = '\0';	
-	int current_index = 6;
-	unsigned int num_to_convert = 9102349;
-
-    while ((num_to_convert) && (current_index >= 0)) {	    
-        my_itoa_buf[current_index] = '0' + (num_to_convert % 10);
-		--current_index;
-		num_to_convert /= 10;
-    }
-*/
-
-	//TODO: Consecutive calls to usb_puts are rarely executed correctly.
-	//TODO: More often than not, only the first call is executed.
-	//TODO: Requires a delay, to allow the USB driver to finish writing to the endpoint, see HID keyboard example.
-	//TODO: Test delay values, how low can I go?
-	//TODO: Wrap usb_puts with a function that add a delay?
-
 	if (g_debug_prints_enabled) {
 		usb_puts("\r\nHeartbeat counter: ");
 		udelay_busy(USB_PUTS_DELAY_USEC);
 		usb_puts(message_buf);
 		udelay_busy(USB_PUTS_DELAY_USEC);
 	}
-	
-	// TODO: Testing toggle TIMER1 PWM compare value
-	// Using the buffered version for CCV to avoid glitches.
-	// Timer will wait until a PWM period is completed before setting the new compare value.
-//	static int direction = 1;
-
-/*
-	if (g_debug_prints_enabled) {
-		usb_puts("\r\nRED LED Direction: ");
-		udelay_busy(USB_PUTS_DELAY_USEC);
-		if (direction > 0) {
-			usb_puts("UP");
-		} else {
-			usb_puts("DOWN");
-		}
-		udelay_busy(USB_PUTS_DELAY_USEC);
-	}
-*/
-
-/*
-	// Modify Red LED PWM duty cycle
-	TIMER1_CC0_CCVB = TIMER1_CC0_CCV + direction*CCV_INCREMENT;
-	if (TIMER1_CC0_CCVB >= LED_PWM_TIMER_TOP_CCV) {
-		TIMER1_CC0_CCVB = LED_PWM_TIMER_TOP_CCV;
-		direction = -1;
-	} else if ((int32_t) (TIMER1_CC0_CCVB) <= 0) {
-		TIMER1_CC0_CCVB = 0;
-		direction = 1;
-	}
-*/
 }
 
+// TODO: Remove this timer
 static void setup_timer2(void)
 {
 	cmu_periph_clock_enable(CMU_TIMER2);
@@ -488,16 +466,94 @@ static void setup_timer2(void)
     // Enable TIMER2 interrupt
     nvic_enable_irq(NVIC_TIMER2_IRQ);
 
-	timer_start(TIMER2);
+	//timer_start(TIMER2); // TODO: Currently disabled, should delete Timer2 entirely unless I can think if a use for it.
+}
+
+// TODO: Maybe cycle_millis should be volatile global, one per LED ?
+static void update_led_state(const enum led_colour led, uint32_t* const cycle_millis)
+{
+	struct led_pwm_cfg* led_cfg = NULL;
+	
+	switch (led) {
+	case GREEN_LED:
+		led_cfg = &g_green_led_cfg;
+	break;
+	case RED_LED:
+		led_cfg = &g_red_led_cfg;
+	break;
+	default:
+		usb_puts("\r\nERROR LED COLOUR!\r\n");
+		return;
+	break;
+	}
+	
+	const uint8_t brightness_delta = led_cfg->max_brightness - led_cfg->min_brightness;
+
+	switch (led_cfg->current_phase) {
+		case LED_PHASE_LOW:
+			if (*cycle_millis >= led_cfg->low_duration_ms) {
+				led_cfg->current_phase = LED_PHASE_RAMP_UP;
+				*cycle_millis = 0;				
+			} else {
+				// Not necessary, but smooths the transition when setting the current phase from outside this function.
+				set_led_timer_ccvb(led, led_cfg->min_brightness);
+			}
+		break;
+		case LED_PHASE_RAMP_UP:
+			if (*cycle_millis >= led_cfg->ramp_up_ms) {
+				led_cfg->current_phase = LED_PHASE_HIGH;
+				set_led_timer_ccvb(led, led_cfg->max_brightness);
+				*cycle_millis = 0;
+			} else {
+				set_led_timer_ccvb(led, led_cfg->min_brightness + (brightness_delta *  (*cycle_millis) / led_cfg->ramp_up_ms));
+			}
+		break;
+		case LED_PHASE_HIGH:
+			if (*cycle_millis >= led_cfg->high_duration_ms) {
+				led_cfg->current_phase = LED_PHASE_RAMP_DOWN;
+				*cycle_millis = 0;
+			} else {
+				// Not necessary, but smooths the transition when setting the current phase from outside this function.
+				set_led_timer_ccvb(led, led_cfg->max_brightness);
+			}
+		break;
+		case LED_PHASE_RAMP_DOWN:
+			if (*cycle_millis >= led_cfg->ramp_down_ms) {
+				led_cfg->current_phase = LED_PHASE_LOW;
+				set_led_timer_ccvb(led, led_cfg->min_brightness);
+				*cycle_millis = 0;
+			} else {
+				set_led_timer_ccvb(led, led_cfg->max_brightness - (brightness_delta *  (*cycle_millis) / led_cfg->ramp_down_ms));
+			}
+		break;
+		default: // Should never happen
+			usb_puts("\r\nERROR LED PHASE!\r\n");
+		break;
+	}
 }
 
 void timer1_isr(void)
 {
 	// Clear overflow interrupt flag
 	TIMER1_IFC = TIMER_IFC_OF;
+	
+	static uint32_t timer_cycles = 0;
+	static uint32_t cycle_millis = 0;
 
-	// TODO: Add fade state machine, as done for green LED
+	if (g_red_counters_reset) {
+		g_red_counters_reset = false;
+		timer_cycles = 0;
+		cycle_millis = 0;
+	}
 
+	++timer_cycles;
+
+	if (!(timer_cycles % LED_PWM_TIMER_CYCLES_PER_MILLISECOND)) {
+		++cycle_millis;
+		timer_cycles = 0;
+	}
+
+	update_led_state(RED_LED, &cycle_millis);
 }
 
 static void setup_timer1(void)
@@ -526,12 +582,10 @@ static void setup_timer1(void)
 
 void timer0_isr(void)
 {
-	// Clear overflow interrupt flag
-	TIMER0_IFC = TIMER_IFC_OF;
+	TIMER0_IFC = TIMER_IFC_OF;	// Clear overflow interrupt flag
 
-	static timer_cycles = 0;
-	static cycle_millis = 0;
-	enum led_colour led = GREEN_LED;
+	static uint32_t timer_cycles = 0;
+	static uint32_t cycle_millis = 0;
 
 	if (g_green_counters_reset) {
 		g_green_counters_reset = false;
@@ -546,55 +600,7 @@ void timer0_isr(void)
 		timer_cycles = 0;
 	}
 
-	// TODO: refactor all of this into a function, for reuse with Red LED.
-	// TODO: Maybe cycle_millis should be volatile global, one per LED.
-	// TODO: Alternatively, the function will receive a pointer to cycle_millis and update it.
-
-	struct led_pwm_cfg* led_cfg = &g_green_led_cfg;
-	uint8_t brightness_delta = led_cfg->max_brightness - led_cfg->min_brightness;
-
-	switch (led_cfg->current_phase) {
-		case LED_PHASE_LOW:
-			if (cycle_millis >= led_cfg->low_duration_ms) {
-				led_cfg->current_phase = LED_PHASE_RAMP_UP;
-				cycle_millis = 0;				
-			} else {
-				// Not necessary, but smooths the transition when setting the current phase from outside this function.
-				set_led_timer_ccvb(led, led_cfg->min_brightness);
-			}
-		break;
-		case LED_PHASE_RAMP_UP:
-			if (cycle_millis >= led_cfg->ramp_up_ms) {
-				led_cfg->current_phase = LED_PHASE_HIGH;
-				set_led_timer_ccvb(led, led_cfg->max_brightness);
-				cycle_millis = 0;
-			} else {
-				set_led_timer_ccvb(led, led_cfg->min_brightness + (brightness_delta *  cycle_millis / led_cfg->ramp_up_ms));
-			}
-		break;
-		case LED_PHASE_HIGH:
-			if (cycle_millis >= led_cfg->high_duration_ms) {
-				led_cfg->current_phase = LED_PHASE_RAMP_DOWN;
-				cycle_millis = 0;
-			} else {
-				// Not necessary, but smooths the transition when setting the current phase from outside this function.
-				set_led_timer_ccvb(led, led_cfg->max_brightness);
-			}
-		break;
-		case LED_PHASE_RAMP_DOWN:
-			if (cycle_millis >= led_cfg->ramp_down_ms) {
-				led_cfg->current_phase = LED_PHASE_LOW;
-				set_led_timer_ccvb(led, led_cfg->min_brightness);
-				cycle_millis = 0;
-			} else {
-				set_led_timer_ccvb(led, led_cfg->max_brightness - (brightness_delta *  cycle_millis / led_cfg->ramp_down_ms));
-			}
-		break;
-		default: // Should never happen
-			usb_puts("\r\nERROR LED PHASE!\r\n");
-		break;
-	}
-
+	update_led_state(GREEN_LED, &cycle_millis);
 }
 
 static void setup_timer0(void)
@@ -640,7 +646,7 @@ static void led_timer_stop(enum led_colour led)
 	}
 }
 
-static void led_timer_start(enum led_colour led)
+inline static void led_timer_start(enum led_colour led)
 {
 	switch (led) {
 		case GREEN_LED:
@@ -650,7 +656,7 @@ static void led_timer_start(enum led_colour led)
 			timer_start(TIMER1);
 		break;
 		default: // Should never happen
-			usb_puts("ERROR LED TIMER START\r\n");
+			//usb_puts("ERROR LED TIMER START\r\n"); // Commented to simplify inline function
 			return;
 		break;
 	}
@@ -670,6 +676,124 @@ static void led_isr_counters_reset(enum led_colour led)
 			return;
 		break;
 	}
+}
+
+static void sync_timers(const enum led_fade_phase green_phase, const enum led_fade_phase red_phase)
+{
+	led_timer_stop(GREEN_LED);
+	led_timer_stop(RED_LED);
+	led_isr_counters_reset(GREEN_LED);
+	led_isr_counters_reset(RED_LED);
+	g_green_led_cfg.current_phase = green_phase;
+	g_red_led_cfg.current_phase = red_phase;
+	udelay_busy(1000);
+	timer_start(TIMER0);
+	timer_start(TIMER1);
+}
+
+// Returns true iff the letter represents a LED fade phase
+static bool set_if_valid_phase_letter(char letter, uint32_t* numeric_value)
+{
+	switch (letter) {
+		case PARAM_PHASE_LOW:
+			*numeric_value = LED_PHASE_LOW;
+			return true;
+		break;
+		case PARAM_PHASE_RAMPUP:
+			*numeric_value = LED_PHASE_RAMP_UP;
+			return true;
+		break;
+		case PARAM_PHASE_RAMPDOWN:
+			*numeric_value = LED_PHASE_RAMP_DOWN;
+			return true;
+		break;
+		case PARAM_PHASE_HIGH:
+			*numeric_value = LED_PHASE_HIGH;
+			return true;
+		break;
+		default:
+			return false;
+		break;
+	}							
+}
+
+// Set the appropriate configuration field for the LED
+// Returns true if successful, false otherwise.
+static bool set_led_cfg_value(enum led_colour led, uint8_t field, uint32_t numeric_value)
+{
+	struct led_pwm_cfg* led_cfg = NULL;
+	
+	switch (led) {
+		case GREEN_LED:
+			led_cfg = &g_green_led_cfg;
+		break;
+		case RED_LED:
+			led_cfg = &g_red_led_cfg;
+		break;
+		default:
+			usb_puts("\r\nERROR LED COLOUR!\r\n");
+			return false;
+		break;
+	}
+
+	switch (field) {
+		case PARAM_MAX_PWM:
+			if (numeric_value > MAX_PWM_VALUE) {
+				usb_puts("ERROR: PWM MAX value: "MAX_PWM_VALUE_STRING"\r\n");
+				return false;
+			}				
+			led_cfg->max_brightness = (uint8_t) numeric_value;
+		break;
+		case PARAM_MIN_PWM:
+			if (numeric_value < MIN_PWM_VALUE) {
+				usb_puts("ERROR: PWM MIN value: "MIN_PWM_VALUE_STRING"\r\n");
+				return false;
+			}				
+			led_cfg->min_brightness = (uint8_t) numeric_value;
+		break;
+		case PARAM_LOW_MS:
+			led_cfg->low_duration_ms = numeric_value;
+		break;
+		case PARAM_HIGH_MS:
+			led_cfg->high_duration_ms = numeric_value;
+		break;
+		case PARAM_RAMPUP_MS:
+			led_cfg->ramp_up_ms = numeric_value;
+		break;
+		case PARAM_RAMPDOWN_MS:
+			led_cfg->ramp_down_ms = numeric_value;
+		break;
+		case PARAM_CURRENT_PHASE:
+			switch (numeric_value) {
+				case LED_PHASE_LOW:
+				case LED_PHASE_RAMP_UP:
+				case LED_PHASE_HIGH:
+				case LED_PHASE_RAMP_DOWN:
+					led_cfg->current_phase = numeric_value;
+				break;
+				default:
+					usb_puts("\r\nERROR PWM PHASE VALUE!\r\n");
+					return false;
+				break;
+			}
+			
+		break;
+		default:
+			usb_puts("\r\nERROR LED CFG FIELD!\r\n");
+			return false;
+		break;
+	}
+
+	if (g_debug_prints_enabled) {
+		char message_buf[11];
+		itoa(numeric_value, message_buf, 10);
+		usb_puts("\r\nSet value: ");
+		udelay_busy(USB_PUTS_DELAY_USEC);
+		usb_puts(message_buf);
+		udelay_busy(USB_PUTS_DELAY_USEC);
+	}
+
+	return true;
 }
 
 static void set_led_test_mode(struct led_pwm_cfg* led_cfg, uint32_t mode)
@@ -740,6 +864,35 @@ static void set_led_test_mode(struct led_pwm_cfg* led_cfg, uint32_t mode)
 	}
 }
 
+static void advance_led_test_mode(const enum led_colour led)
+{
+	static uint32_t green_led_test_mode = 0;
+	static uint32_t red_led_test_mode = 0;
+	uint32_t* current_test_mode = NULL;
+	
+	switch (led) {
+	case GREEN_LED:
+		set_led_test_mode(&g_green_led_cfg, green_led_test_mode);
+		current_test_mode = &green_led_test_mode;
+	break;
+	case RED_LED:
+		set_led_test_mode(&g_red_led_cfg, red_led_test_mode);
+		current_test_mode = &red_led_test_mode;
+	break;
+	default:
+		usb_puts("\r\nERROR LED COLOUR!\r\n");
+		return;
+	break;
+	}
+
+	if (*current_test_mode >= LED_TEST_MODE_MAX) {
+		*current_test_mode = 0;
+	} else {
+		++(*current_test_mode);
+	}
+}
+
+// Parses commands with one parameter: Either 0 or 1
 // Returns: true on successful parse, false otherwise.
 static bool parse_flag(uint8_t flag, uint8_t param_char)
 {
@@ -776,63 +929,46 @@ static bool parse_flag(uint8_t flag, uint8_t param_char)
 	return false; // Shouldn't get here
 }
 
+// buffer is not assumed to be null-terminated
 // Returns: true on successful parse, false otherwise.
-// Is successful, the value of last_char is the index of the last element parsed in the buffer
-static bool parse_led_params(enum led_colour led, uint8_t* buffer, uint32_t len, uint32_t* last_char)
+// If successful, numeric_value is set to the value parsed.
+// If successful, the value of last_char is the index of the last element parsed in the buffer
+static bool parse_numeric_value(char* buffer, uint32_t len, uint32_t* numeric_value, uint32_t* last_char)
 {
-	uint32_t current_char_index = 0;
-	uint32_t current_string_index = 0;
-	struct led_pwm_cfg* led_cfg = NULL;
-	uint8_t* param_strings[NUM_LED_PARAMS];
+	uint32_t current_value = 0;
+	uint32_t num_digits = 0;
 
-	if ((buffer == NULL) || (last_char == NULL) || (len == 0)) {
-		usb_puts("ERROR PARSE LED PARAMS\r\n");
+	if ((buffer == NULL) || (numeric_value == NULL) || (last_char == NULL) || (len == 0)) {
+		usb_puts("ERROR PARSE NUMERIC VALUE\r\n");
 		return false;
 	}
 
-	switch (led) {
-		case GREEN_LED:
-			led_cfg = &g_green_led_cfg;
-		break;
-		case RED_LED:
-			led_cfg = &g_red_led_cfg;
-		break;
-		default: // Should never happen
-			usb_puts("ERROR PARSE LED PARAMS\r\n");
-			return;
-		break;
+	while (num_digits <= len) {
+		if (isdigit((int) buffer[num_digits])) {
+			current_value = (current_value * 10) + (buffer[num_digits] - '0');
+			++num_digits;
+		} else {
+			break;
+		}
 	}
 
-	while (current_char_index < len) {
-		// TODO: Go through all the whitespace using isspace, find a string, add it's start value to an array.
-		// TODO: When you find the next whitespace, set it as NULL termination '\0'
-		// TODO: If the last parameter string is the last index of the buffer, there is no room for whitespace.
-		// TODO: Handle this case somehow... will I be forced to allocase buffers for all params?
-
-		++current_char_index;
-	}
-
-	// TODO: We expect at least 7 strings: min max high low rampup rampdown phase
-	if (current_string_index < (NUM_LED_PARAMS - 1)) {
-		usb_puts("ERROR: Missing LED parameters!\r\n");
+	if (num_digits == 0) {
+		usb_puts("ERROR: Converting string to numeric value!\r\n");
 		return false;
 	}
 
-	// TODO: After all strings are found, convert each one using strtol (or atoi)
-	// TODO: Verify the number is legal, i.e. percentage 0-100, phase type (letter?)
-	// TODO: Verify the number isn't negative for milliseconds, or just treat it as uint32_t, very large positive.
-	// TODO: Set the converted number to the appropriate cfg setting
-
-	// TODO: Set the value of last_char to the last char index included in a string, not 
+	*numeric_value = current_value;    
+	(*last_char)+= (num_digits - 1);
 
 	return true;
 }
 
 static void handle_command(uint8_t* cmd_buffer, uint32_t buffer_len)
 {
-	static uint8_t test_mode = 0;
 	uint8_t current_flag;
 	enum led_colour current_led;
+	uint8_t current_field;
+	uint32_t numeric_value;
 
 	if ((cmd_buffer == NULL) || (buffer_len == 0)) {
 		return;
@@ -847,23 +983,13 @@ static void handle_command(uint8_t* cmd_buffer, uint32_t buffer_len)
 		}
 
 		switch (toupper(cmd_buffer[current_char])) {
+			case CMD_HELP:
+				//TODO: call a function which prints the usage message
+			break;	 
 			case CMD_TEST_MODE:
-
-				// LED configuration should stop the timer, then set config values, then start timer.
-				// TODO: Generelize into a function which accept enum led_colour, so the function would know which TIMER to restart, etc.
-				// TODO: But then I wouldn't be able to sync the LEDs, so maybe don't include the timer stuff in cfg function.
-
-				// TODO: Currently test mode is only for Green LED
-				led_timer_stop(GREEN_LED);
-				set_led_test_mode(&g_green_led_cfg, test_mode);
-				led_isr_counters_reset(GREEN_LED);
-				led_timer_start(GREEN_LED);
-
-				if (test_mode >= LED_TEST_MODE_MAX) {
-					test_mode = 0;
-				} else {
-					++test_mode;
-				}
+				advance_led_test_mode(GREEN_LED);
+				advance_led_test_mode(RED_LED);
+				sync_timers(LED_PHASE_LOW, LED_PHASE_LOW);	
 			break;
 			case CMD_DEBUG_PRINTS_FLAG:
 			case CMD_SERIAL_ECHO_FLAG:
@@ -877,10 +1003,13 @@ static void handle_command(uint8_t* cmd_buffer, uint32_t buffer_len)
 					return; // Don't parse the rest of the input
 				}
 			break;
-			case CMD_GREEN_LED_FLAG:
-			case CMD_RED_LED_FLAG:
+			case CMD_SYNC_TIMERS:
+				sync_timers(LED_PHASE_LOW, LED_PHASE_LOW); // TODO: Parse the next two params to get phases from user
+			break;
+			case CMD_GREEN_LED_CFG:
+			case CMD_RED_LED_CFG:
 
-				if (toupper(cmd_buffer[current_char]) == CMD_GREEN_LED_FLAG) {
+				if (toupper(cmd_buffer[current_char]) == CMD_GREEN_LED_CFG) {
 					current_led = GREEN_LED;
 				} else {
 					current_led = RED_LED;
@@ -894,25 +1023,45 @@ static void handle_command(uint8_t* cmd_buffer, uint32_t buffer_len)
 
 				led_timer_stop(current_led);
 				
-				if (cmd_buffer[current_char] == ' ') {
-					if (!parse_led_params(current_led, &(cmd_buffer[current_char]), buffer_len - current_char, &current_char)) {
-						// Restore the timer, will use unmodified settings.
-						led_isr_counters_reset(current_led);
-						led_timer_start(current_led);
+				switch (toupper(cmd_buffer[current_char]))	{
+					case PARAM_TEST_MODE:
+						advance_led_test_mode(current_led);
+					break;
+					case PARAM_MAX_PWM:
+					case PARAM_MIN_PWM:
+					case PARAM_LOW_MS:
+					case PARAM_HIGH_MS:
+					case PARAM_RAMPUP_MS:
+					case PARAM_RAMPDOWN_MS:
+					case PARAM_CURRENT_PHASE:
+
+						current_field = toupper(cmd_buffer[current_char]);
+
+						++current_char;
+						if (current_char >= buffer_len) {
+							usb_puts("ERROR: Missing value!\r\n");
+							return; // Don't parse the rest of the input
+						}
+
+						if ((current_field == PARAM_CURRENT_PHASE) && (set_if_valid_phase_letter((char) toupper(cmd_buffer[current_char]), &numeric_value))) {
+							// numeric_value was set to the appropriate phase enum value														
+						} else if (!parse_numeric_value((char*) &(cmd_buffer[current_char]), buffer_len - current_char, &numeric_value, &current_char)) {
+							return; // Don't parse the rest of the input
+						}
+
+						if (!set_led_cfg_value(current_led, current_field, numeric_value)) {
+							return; // Don't parse the rest of the input
+						}
+					break;
+
+					default:
+						usb_puts("ERROR: Unknown param!\r\n");
 						return; // Don't parse the rest of the input
-					}
+					break;
 				}
-
-				// TODO: Switch case of different LED param letters here? X N H L U D P
-
 
 				led_isr_counters_reset(current_led);
 				led_timer_start(current_led);
-
-			// TODO: Maybe instead of parsing a string with 7 different parameters, I'll first implement setting each one seperately?
-			// TODO: E.g. GX100 GN0 GH1500 GL800 GU1000 GD2000 GPL
-			// TODO: Set Green LED max, min, high_ms, low_ms, rampup_ms, rampdown_ms, phase (L/H/U/D)
-			// TODO: If 'G' is followed by a space, I can parse the full command, otherwise just one param.
 
 			break;
 			default:
@@ -921,23 +1070,9 @@ static void handle_command(uint8_t* cmd_buffer, uint32_t buffer_len)
 		} // Switch
 
 		++current_char;
-	}
+	} // while()
 
-/* // TODO: Remove this
-	if (g_debug_prints_enabled) {
-		usb_puts("Command received\r\n");
-		udelay_busy(USB_PUTS_DELAY_USEC);
-	}
-*/
-	// TODO: Parse the command.
-	// TODO: Add function to parse LED config and return success/failure
-	// TODO: G MIN_% MAX_% LOW_MS RAMPUP_MS HIGH_MS RAMPDOWN_MS R MIN_% …
-	// TODO: Add function to pase a flag (input 0/1) and return flag value or failure
-	// TODO: Or maybe send the address of the bool to set, and have the function handle everything?
-	// TODO: D1 D0 E1 E0
-
-
-}
+} // handle_command
 
 int main(void)
 {
