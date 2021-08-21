@@ -1,11 +1,11 @@
 /**
- *TODO: Update this text
- * This example implements a USB CDC-ACM device (aka Virtual Serial Port)
- * to demonstrate the use of the USB device stack.
- *
- * When data is recieved, it will toggle the green LED and echo the data.
- * The red LED is toggled constantly and a string is sent over USB every
- * time the LED changes state as a heartbeat.
+ * This example demonstrates using EFM32HG Timer PWM and interrupts.
+ * The program implements a USB CDC-ACM device (aka Virtual Serial Port)
+ * to provide a shell interface to the Tomu's LEDs.
+ * The green and red LEDs can be configured individually, and synchronized, 
+ * to create a vareity of fade/blink/brighness patterns.
+ * The interface lends itself to scripting, so the Tomu can be used as a notification light.
+ * See the README.md file for full command syntax.
  */
 
 #include <libopencm3/cm3/common.h>
@@ -25,7 +25,7 @@
 #include <string.h>
 #include <ctype.h>
 
-// Make this program compatible with Toboot-V2.0
+// Makes this program compatible with Toboot-V2.0
 #include <toboot.h>
 TOBOOT_CONFIGURATION(0);
 //TOBOOT_CONFIGURATION(TOBOOT_CONFIG_FLAG_AUTORUN); // Uncomment to boot directly to this app, instead of the DFU bootloader.
@@ -45,15 +45,14 @@ TOBOOT_CONFIGURATION(0);
 #define BAUD_RATE       19200
 #define BIT_TIME_US     (1000000/BAUD_RATE)    // Bit time in uS
 
-//TODO: Consecutive calls to usb_puts are rarely executed correctly.
-//TODO: More often than not, only the first call is executed.
-//TODO: Requires a delay, to allow the USB driver to finish writing to the endpoint, see HID keyboard example.
-//TODO: Wrap usb_puts with a function that add a delay?
+// Consecutive calls to usb_puts are not likely to be successful.
+// Without a delay between them, more often than not only the first call is executed.
+// The delay allows the USB driver to finish writing to the endpoint, see HID keyboard example program.
 #define USB_PUTS_DELAY_USEC 5000
 
-#define TIMER_INPUT_CLOCK_FREQUENCY 24000000
+#define TIMER_INPUT_CLOCK_FREQUENCY 24000000 // 24 MHz clock
 #define LED_PWM_TIMER_TOP_CCV 100
-#define LED_PWM_TIMER_PRESCALER TIMER_CTRL_PRESC_DIV16 // TODO: Is this a good value? Should I decrease for accuracy?
+#define LED_PWM_TIMER_PRESCALER TIMER_CTRL_PRESC_DIV16 // Provides ~99% accuracy. Use PRESC_DIV2 for ~99.8% accuracy.
 #define LED_PWM_TIMER_CYCLES_PER_SECOND ((LED_PWM_TIMER_TOP_CCV + 1) * (1 << LED_PWM_TIMER_PRESCALER))
 #define LED_PWM_TIMER_CYCLES_PER_MILLISECOND (uint32_t) ((((float) TIMER_INPUT_CLOCK_FREQUENCY / LED_PWM_TIMER_CYCLES_PER_SECOND) + 500) / 1000)
 
@@ -63,8 +62,9 @@ TOBOOT_CONFIGURATION(0);
 #define MIN_PWM_VALUE 0
 #define MIN_PWM_VALUE_STRING "0"
 
-
+// Supported commands
 #define CMD_HELP 'H'
+#define CMD_PRINT 'P'
 #define CMD_GREEN_LED_CFG 'G'
 #define CMD_RED_LED_CFG 'R'
 #define CMD_SYNC_TIMERS 'S'
@@ -87,7 +87,11 @@ TOBOOT_CONFIGURATION(0);
 #define PARAM_PHASE_RAMPUP 'U'
 #define PARAM_PHASE_RAMPDOWN 'D'
 
-#define NUM_LED_PARAMS 7
+#define PARAM_GREEN_LED 'G'
+#define PARAM_GREEN_LED_STRING "G"
+#define PARAM_RED_LED 'R'
+#define PARAM_RED_LED_STRING "R"
+
 #define LED_TEST_MODE_MAX 4
 
 enum led_colour {
@@ -429,47 +433,7 @@ inline static void set_led_timer_ccvb(enum led_colour led, uint32_t value)
 	}
 }
 
-// TODO: Remove this timer
-void timer2_isr(void)
-{
-	static unsigned int heartbeat_count = 0;
-	char message_buf[8];
-
-	// Clear overflow interrupt flag
-	TIMER2_IFC = TIMER_IFC_OF;
-
-	++heartbeat_count;
-	itoa(heartbeat_count, message_buf, 10);
-
-	if (g_debug_prints_enabled) {
-		usb_puts("\r\nHeartbeat counter: ");
-		udelay_busy(USB_PUTS_DELAY_USEC);
-		usb_puts(message_buf);
-		udelay_busy(USB_PUTS_DELAY_USEC);
-	}
-}
-
-// TODO: Remove this timer
-static void setup_timer2(void)
-{
-	cmu_periph_clock_enable(CMU_TIMER2);
-
-	// Initialize TIMER2
-	timer_set_clock_prescaler(TIMER2, TIMER_CTRL_PRESC_DIV1024);	
-	// Top value of 24000, for div 1024, for 24 MHz clock is 1 Hz
-	// So 48000 is once every 2 seconds
-	timer_set_top(TIMER2, 48000); //TODO: Don't use magic number
-    
-    TIMER2_IEN = TIMER_IEN_OF;
-    TIMER2_CNT = 0;
-
-    // Enable TIMER2 interrupt
-    nvic_enable_irq(NVIC_TIMER2_IRQ);
-
-	//timer_start(TIMER2); // TODO: Currently disabled, should delete Timer2 entirely unless I can think if a use for it.
-}
-
-// TODO: Maybe cycle_millis should be volatile global, one per LED ?
+// State machine for LED fade phases cycle
 static void update_led_state(const enum led_colour led, uint32_t* const cycle_millis)
 {
 	struct led_pwm_cfg* led_cfg = NULL;
@@ -532,6 +496,7 @@ static void update_led_state(const enum led_colour led, uint32_t* const cycle_mi
 	}
 }
 
+// Interrupt for Red LED
 void timer1_isr(void)
 {
 	// Clear overflow interrupt flag
@@ -556,6 +521,7 @@ void timer1_isr(void)
 	update_led_state(RED_LED, &cycle_millis);
 }
 
+// Timer1 used for Red LED PWM
 static void setup_timer1(void)
 {
 	cmu_periph_clock_enable(CMU_TIMER1);
@@ -580,6 +546,7 @@ static void setup_timer1(void)
 	timer_start(TIMER1);
 }
 
+// Interrupt for Green LED
 void timer0_isr(void)
 {
 	TIMER0_IFC = TIMER_IFC_OF;	// Clear overflow interrupt flag
@@ -603,6 +570,7 @@ void timer0_isr(void)
 	update_led_state(GREEN_LED, &cycle_millis);
 }
 
+// Timer0 used for Green LED PWM
 static void setup_timer0(void)
 {
 	cmu_periph_clock_enable(CMU_TIMER0);
@@ -692,6 +660,7 @@ static void sync_timers(const enum led_fade_phase green_phase, const enum led_fa
 }
 
 // Returns true iff the letter represents a LED fade phase
+// If valid, sets numeric_value to the corresponding enum value.
 static bool set_if_valid_phase_letter(char letter, uint32_t* numeric_value)
 {
 	switch (letter) {
@@ -861,6 +830,7 @@ static void set_led_test_mode(struct led_pwm_cfg* led_cfg, uint32_t mode)
 		udelay_busy(USB_PUTS_DELAY_USEC);
 		itoa(mode, message_buf, 10);
 		usb_puts(message_buf);
+		udelay_busy(USB_PUTS_DELAY_USEC);
 	}
 }
 
@@ -929,7 +899,7 @@ static bool parse_flag(uint8_t flag, uint8_t param_char)
 	return false; // Shouldn't get here
 }
 
-// buffer is not assumed to be null-terminated
+// Input parameter buffer is not assumed to be null-terminated
 // Returns: true on successful parse, false otherwise.
 // If successful, numeric_value is set to the value parsed.
 // If successful, the value of last_char is the index of the last element parsed in the buffer
@@ -963,6 +933,120 @@ static bool parse_numeric_value(char* buffer, uint32_t len, uint32_t* numeric_va
 	return true;
 }
 
+static void print_led_cfg(struct led_pwm_cfg* led_cfg)
+{
+	if (led_cfg == NULL) {
+		usb_puts("ERROR PRINT LED CFG\r\n");
+		return;
+	}
+
+	char string_buffer[12];
+
+	usb_puts("\r\n=== LED CFG ===");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+	
+	usb_puts("\r\nMin brightness %: ");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+	
+	itoa(led_cfg->min_brightness, string_buffer, 10);
+	usb_puts(string_buffer);
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nMax brightness %: ");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+	
+	itoa(led_cfg->max_brightness, string_buffer, 10);
+	usb_puts(string_buffer);
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nLow duration ms: ");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+	
+	itoa(led_cfg->low_duration_ms, string_buffer, 10);
+	usb_puts(string_buffer);
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nRamp up time ms: ");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+	
+	itoa(led_cfg->ramp_up_ms, string_buffer, 10);
+	usb_puts(string_buffer);
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nHigh duration ms: ");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+	
+	itoa(led_cfg->high_duration_ms, string_buffer, 10);
+	usb_puts(string_buffer);
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nRamp down time ms: ");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+	
+	itoa(led_cfg->ramp_down_ms, string_buffer, 10);
+	usb_puts(string_buffer);
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nCurrent Phase [Low, Ramp up, High, Ramp down]: ");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+	
+	// Output the current phase as a letter
+	string_buffer[1] = '\r';
+	string_buffer[2] = '\n';
+	string_buffer[3] = '\0';
+	
+	switch (led_cfg->current_phase) {
+		case LED_PHASE_LOW:
+			string_buffer[0] = PARAM_PHASE_LOW;
+		break;
+		case LED_PHASE_RAMP_UP:
+			string_buffer[0] = PARAM_PHASE_RAMPUP;
+		break;
+		case LED_PHASE_HIGH:
+			string_buffer[0] = PARAM_PHASE_HIGH;
+		break;
+		case LED_PHASE_RAMP_DOWN:
+			string_buffer[0] = PARAM_PHASE_RAMPDOWN;
+		break;
+		default: // Should never happen
+			strcpy(string_buffer, "ERROR");
+		break;
+	}
+	
+	usb_puts(string_buffer);
+	udelay_busy(USB_PUTS_DELAY_USEC);
+}
+
+static void print_help()
+{
+	usb_puts("\r\nUsage: <COMMAND>[PARAMETERS] <COMMAND>...");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nSupported commands: <H,T,D,E,P,S,G,R>");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nPrint help message: <H>");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nAdvance both LEDs to their next test mode: <T>");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nDisable/Enable debug printout: <D><0,1>");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nDisable/Enable serial shell echo: <E><0,1>");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nPrint current configuration of the Green/Red LED: <P><G,R>");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nSync LEDs from phase (Green,Red): <S><[L,U,H,D][L,U,H,D]>");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	usb_puts("\r\nSet Green/Red LED config: <G,R><T,N,X,L,U,H,D,P>\r\n");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+}
+
 static void handle_command(uint8_t* cmd_buffer, uint32_t buffer_len)
 {
 	uint8_t current_flag;
@@ -984,7 +1068,27 @@ static void handle_command(uint8_t* cmd_buffer, uint32_t buffer_len)
 
 		switch (toupper(cmd_buffer[current_char])) {
 			case CMD_HELP:
-				//TODO: call a function which prints the usage message
+				print_help();
+			break;
+			case CMD_PRINT:
+				++current_char;
+				if (current_char >= buffer_len) {
+					usb_puts("ERROR: Missing Print parameter: ["PARAM_GREEN_LED_STRING","PARAM_RED_LED_STRING"]\r\n");
+					return; // Don't parse the rest of the input
+				}
+
+				switch (toupper(cmd_buffer[current_char]))	{
+					case PARAM_GREEN_LED:
+						print_led_cfg(&g_green_led_cfg);
+					break;
+					case PARAM_RED_LED:
+						print_led_cfg(&g_red_led_cfg);
+					break;
+					default:
+						usb_puts("ERROR: Expected Print parameter: ["PARAM_GREEN_LED_STRING","PARAM_RED_LED_STRING"]\r\n");
+						return; // Don't parse the rest of the input
+					break;
+				}
 			break;	 
 			case CMD_TEST_MODE:
 				advance_led_test_mode(GREEN_LED);
@@ -1004,7 +1108,33 @@ static void handle_command(uint8_t* cmd_buffer, uint32_t buffer_len)
 				}
 			break;
 			case CMD_SYNC_TIMERS:
-				sync_timers(LED_PHASE_LOW, LED_PHASE_LOW); // TODO: Parse the next two params to get phases from user
+			{
+				++current_char;
+				if (current_char >= buffer_len) {
+					usb_puts("ERROR: Missing Green LED phase!\r\n");
+					return; // Don't parse the rest of the input
+				}
+
+				uint32_t green_led_phase_value;
+				if (!set_if_valid_phase_letter((char) toupper(cmd_buffer[current_char]), &green_led_phase_value)) {
+					usb_puts("ERROR: Expected phase letter!\r\n");
+					return; // Don't parse the rest of the input
+				}
+
+				++current_char;
+				if (current_char >= buffer_len) {
+					usb_puts("ERROR: Missing Red LED phase!\r\n");
+					return; // Don't parse the rest of the input
+				}
+
+				uint32_t red_led_phase_value;
+				if (!set_if_valid_phase_letter((char) toupper(cmd_buffer[current_char]), &red_led_phase_value)) {
+					usb_puts("ERROR: Expected phase letter!\r\n");
+					return; // Don't parse the rest of the input
+				}
+
+				sync_timers(green_led_phase_value, red_led_phase_value);
+			}
 			break;
 			case CMD_GREEN_LED_CFG:
 			case CMD_RED_LED_CFG:
@@ -1104,15 +1234,12 @@ int main(void)
 	// Enable USB IRQs
 	nvic_enable_irq(NVIC_USB_IRQ);
 
-	// TODO: Should probably leave all values initialized to 0, and have the Timer as Off by default.
-
-	// Initialize LED fade values
+	// Initialize LED fade values to first test mode
 	set_led_test_mode(&g_green_led_cfg, 0); 
 	set_led_test_mode(&g_red_led_cfg, 0); 
 
 	setup_timer0();
 	setup_timer1();
-	setup_timer2();
 
 	while (1) {
 
