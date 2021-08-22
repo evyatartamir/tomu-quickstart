@@ -42,19 +42,16 @@ TOBOOT_CONFIGURATION(0);
 #define PRODUCT_ID      0x70b1  // Assigned to Tomu project
 #define DEVICE_VER      0x0BEB  // Program version
 
-#define BAUD_RATE       19200
-#define BIT_TIME_US     (1000000/BAUD_RATE)    // Bit time in uS
-
 // Consecutive calls to usb_puts are not likely to be successful.
 // Without a delay between them, more often than not only the first call is executed.
-// The delay allows the USB driver to finish writing to the endpoint, see HID keyboard example program.
-#define USB_PUTS_DELAY_USEC 5000
+// The delay allows the USB driver to finish writing to the endpoint.
+#define USB_PUTS_DELAY_USEC 4000
 
 #define TIMER_INPUT_CLOCK_FREQUENCY 24000000 // 24 MHz clock
 #define LED_PWM_TIMER_TOP_CCV 100
 #define LED_PWM_TIMER_PRESCALER TIMER_CTRL_PRESC_DIV16 // Provides ~99% accuracy. Use PRESC_DIV2 for ~99.8% accuracy.
-#define LED_PWM_TIMER_CYCLES_PER_SECOND ((LED_PWM_TIMER_TOP_CCV + 1) * (1 << LED_PWM_TIMER_PRESCALER))
-#define LED_PWM_TIMER_CYCLES_PER_MILLISECOND (uint32_t) ((((float) TIMER_INPUT_CLOCK_FREQUENCY / LED_PWM_TIMER_CYCLES_PER_SECOND) + 500) / 1000)
+#define LED_PWM_TIMER_CYCLES_DENOMINATOR ((LED_PWM_TIMER_TOP_CCV + 1) * (1 << LED_PWM_TIMER_PRESCALER))
+#define LED_PWM_TIMER_CYCLES_PER_MILLISECOND (uint32_t) ((((float) TIMER_INPUT_CLOCK_FREQUENCY / LED_PWM_TIMER_CYCLES_DENOMINATOR) + 500) / 1000)
 
 // Duty cycle percentage
 #define MAX_PWM_VALUE 100
@@ -714,10 +711,12 @@ static bool set_led_cfg_value(enum led_colour led, uint8_t field, uint32_t numer
 			led_cfg->max_brightness = (uint8_t) numeric_value;
 		break;
 		case PARAM_MIN_PWM:
+			/* // As long as MIN_PWM_VALUE == 0, this comparison to unsigned is redundant
 			if (numeric_value < MIN_PWM_VALUE) {
 				usb_puts("ERROR: PWM MIN value: "MIN_PWM_VALUE_STRING"\r\n");
 				return false;
-			}				
+			}
+			*/			
 			led_cfg->min_brightness = (uint8_t) numeric_value;
 		break;
 		case PARAM_LOW_MS:
@@ -866,7 +865,7 @@ static void advance_led_test_mode(const enum led_colour led)
 // Returns: true on successful parse, false otherwise.
 static bool parse_flag(uint8_t flag, uint8_t param_char)
 {
-	bool* flag_p = NULL;
+	volatile bool* flag_p = NULL;
 
 	switch (flag) {
 	case CMD_DEBUG_PRINTS_FLAG:
@@ -987,7 +986,7 @@ static void print_led_cfg(struct led_pwm_cfg* led_cfg)
 	usb_puts(string_buffer);
 	udelay_busy(USB_PUTS_DELAY_USEC);
 
-	usb_puts("\r\nCurrent Phase [Low, Ramp up, High, Ramp down]: ");
+	usb_puts("\r\nCurrent Phase [Low, Ramp up, High, Ramp Down]: ");
 	udelay_busy(USB_PUTS_DELAY_USEC);
 	
 	// Output the current phase as a letter
@@ -1196,7 +1195,7 @@ static void handle_command(uint8_t* cmd_buffer, uint32_t buffer_len)
 			break;
 			default:
 				usb_puts("ERROR Parsing Command\r\n");
-				return;
+				return; // Don't parse the rest of the input
 		} // Switch
 
 		++current_char;
