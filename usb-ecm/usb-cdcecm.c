@@ -307,25 +307,25 @@ static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev,
     (void)buf;
     (void)usbd_dev;
 
-    gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN); // TODO: Light the Green LED for debug
-
     switch(req->bRequest) {
-        /*
+        
         case USB_CDC_REQ_SET_CONTROL_LINE_STATE: {
             g_usbd_is_connected = req->wValue & 1; // Check RTS bit
+            /*
             if (!g_usbd_is_connected) // Note: GPIO polarity is inverted
                 gpio_set(LED_GREEN_PORT, LED_GREEN_PIN);
             else
                 gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN);
             return USBD_REQ_HANDLED;
+            */
             }
         break;
         case USB_CDC_REQ_SET_LINE_CODING: 
             if (*len < sizeof(struct usb_cdc_line_coding))
-                return 0;
+                return USBD_REQ_NOTSUPP;
             return USBD_REQ_HANDLED;        
         break;
-        */
+        
         case USB_CDC_REQ_SET_ETHERNET_MULTICAST_FILTERS:
         case USB_CDC_REQ_SET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER:
         case USB_CDC_REQ_GET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER:
@@ -370,8 +370,8 @@ static void cdcecm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
     (void)ep;
     (void)usbd_dev;
 
-
-    gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN); // TODO: Light the Green LED for debug
+    gpio_toggle(LED_RED_PORT, LED_RED_PIN); // TODO: Light the Red LED for debug
+    // gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN); // TODO: Light the Green LED for debug
 
 /*
     char buf[64];
@@ -405,42 +405,39 @@ static void cdc_altsetting_cc(usbd_device *usbd_dev, uint16_t wIndex, uint16_t w
 {
     (void)usbd_dev;
 
-    gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN); // TODO: Light the Green LED for debug
-
     if (wIndex != CDC_ECM_DATA_INTERFACE_NUM) {
         return;
     }
 
-    if (wValue != 1) {
+    if (wValue != 1) { // The ECM Data alternate interface
         return;
     }
 
-
     // Set alternate ECM data interface
 
-    // gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN); // TODO: Light the Green LED for debug
+    // TODO: If I remove the optional notification endpoint, this can be removed as well.
 
     struct usb_cdc_notification_header notify_buf;
     notify_buf.bmRequestType = 0xA1; // TODO: Not magic number
     notify_buf.wIndex = wIndex;
-    // TODO: Send a notification for NetworkConnection + ConnectionSpeedChange
-    // TODO: See CDC doc 6.3.1
+    // Send a notification for NetworkConnection + ConnectionSpeedChange
+    // See USB CDC document 6.3.1
     notify_buf.bNotificationCode = USB_CDC_ECM_NOTIFICATION_NETWORK_CONNECTION;
     notify_buf.wLength = 0;        
     notify_buf.wValue = 1; // 1 = Connected, 0 = Disconnected.
-    usbd_ep_write_packet(g_usbd_dev, 0x86, &notify_buf, sizeof(notify_buf));
+    usbd_ep_write_packet(g_usbd_dev, CDC_ECM_NOTIFY_EP, &notify_buf, sizeof(notify_buf));
     
     udelay_busy(1000); // TODO: Needed?
 
     struct usb_cdc_notification_speed_change notify_speed_change;
-    notify_speed_change.notify_header.bmRequestType = 0xA1; // TODO: Not magic number
+    notify_speed_change.notify_header.bmRequestType = 0xA1; // TODO: Don't use a magic number
     notify_speed_change.notify_header.bNotificationCode = USB_CDC_ECM_NOTIFICATION_CONNECTION_SPEED_CHANGE;
     notify_speed_change.notify_header.wIndex = wIndex;
     notify_speed_change.notify_header.wValue = 0;
     notify_speed_change.notify_header.wLength = 8;
     notify_speed_change.dlbitrate = 10000000; // 10 Mbps
     notify_speed_change.ulbitrate = 10000000; // 10 Mbps
-    usbd_ep_write_packet(g_usbd_dev, 0x86, &notify_speed_change, sizeof(notify_speed_change));
+    usbd_ep_write_packet(g_usbd_dev, CDC_ECM_NOTIFY_EP, &notify_speed_change, sizeof(notify_speed_change));
 
     return;
 }
@@ -505,13 +502,14 @@ int main(void)
     gpio_mode_setup(LED_RED_PORT, GPIO_MODE_WIRED_AND, LED_RED_PIN);
     gpio_mode_setup(LED_GREEN_PORT, GPIO_MODE_WIRED_AND, LED_GREEN_PIN);
 
+    gpio_set(LED_RED_PORT, LED_RED_PIN); // Turn off red LED
+    gpio_set(LED_GREEN_PORT, LED_GREEN_PIN); // Turn off green LED
+
     /* Configure the USB core & stack */
     g_usbd_dev = usbd_init(&efm32hg_usb_driver, &dev, &config, usb_strings, NUM_USB_STRINGS, usbd_control_buffer, sizeof(usbd_control_buffer));
-    usbd_register_set_altsetting_callback(g_usbd_dev, cdc_altsetting_cc);
+    // usbd_register_set_altsetting_callback(g_usbd_dev, cdc_altsetting_cc);
     usbd_register_set_config_callback(g_usbd_dev, cdc_set_config);
     
-    cdc_set_config(g_usbd_dev, 0); // TODO: This is pointless
-
     /* Set the CPU Core to run from the trimmed USB clock, divided by 2.
      * This will give the CPU Core a frequency of 24 MHz +/- 1% */
     CMU_CMD = (5 << 0);
@@ -536,7 +534,7 @@ int main(void)
 
         // TODO: Remove this, find another use for the LEDs
         // usb_puts("toggling LED\n\r");            
-        gpio_toggle(LED_RED_PORT, LED_RED_PIN);  
+        // gpio_toggle(LED_RED_PORT, LED_RED_PIN);  
         udelay_busy(500000);
     }
 }
