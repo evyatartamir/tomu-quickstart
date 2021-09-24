@@ -66,6 +66,38 @@
 #define USB_CDC_INTERFACE_SUBCLASS_ECM 0x06
 #define USB_CDC_DESCRIPTOR_SUBTYPE_ETHERNET 0x0F 
 
+#define USB_CDC_REQ_SET_ETHERNET_PACKET_FILTER 0x43 // Required by ECM standard
+// TODO: These are optional
+#define USB_CDC_REQ_SET_ETHERNET_MULTICAST_FILTERS 0x40
+#define USB_CDC_REQ_SET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER 0x41
+#define USB_CDC_REQ_GET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER 0x42
+#define USB_CDC_REQ_GET_ETHERNET_STATISTIC 0x44
+
+#define USB_CDC_ECM_NOTIFICATION_NETWORK_CONNECTION 0x0;
+#define USB_CDC_ECM_NOTIFICATION_RESPONSE_AVAILABLE 0x1;
+#define USB_CDC_ECM_NOTIFICATION_CONNECTION_SPEED_CHANGE 0x2A;
+
+#define CDC_ECM_DATA_OUT_EP 0x01
+#define CDC_ECM_DATA_IN_EP 0x82
+#define CDC_ECM_NOTIFY_EP 0x83
+
+#define CDC_ECM_COMM_INTERFACE_NUM 0
+#define CDC_ECM_DATA_INTERFACE_NUM 1
+
+struct usb_cdc_notification_header {
+    uint8_t bmRequestType;
+    uint8_t bNotificationCode;
+    uint8_t wValue;
+    uint8_t wIndex;
+    uint8_t wLength;
+} __attribute__((packed));
+
+struct usb_cdc_notification_speed_change {
+    struct usb_cdc_notification_header notify_header;
+    uint32_t dlbitrate;
+    uint32_t ulbitrate;
+} __attribute__((packed));
+
 struct usb_cdc_ecm_descriptor {
 	uint8_t bFunctionLength;
 	uint8_t bDescriptorType;
@@ -87,7 +119,8 @@ static const struct usb_device_descriptor dev = {
     .bDescriptorType = USB_DT_DEVICE,
     .bcdUSB = 0x0200,
     .bDeviceClass = USB_CLASS_CDC,
-    .bDeviceSubClass = 0, // Unused in CDC device
+    // .bDeviceSubClass = 0, // Unused in CDC device
+    .bDeviceSubClass = USB_CDC_INTERFACE_SUBCLASS_ECM, // TODO: Pointless, but this way in Blackberry
     .bDeviceProtocol = 0, // Unused in CDC device
     .bMaxPacketSize0 = 64,
     .idVendor = VENDOR_ID,
@@ -99,96 +132,34 @@ static const struct usb_device_descriptor dev = {
     .bNumConfigurations = 1,
 };
 
-/*
- * This notification endpoint isn't implemented. According to CDC spec its
- * optional, but its absence causes a NULL pointer dereference in Linux
- * cdc_acm driver.
- */
-static const struct usb_endpoint_descriptor acm_comm_endp[] = {{
-    .bLength = USB_DT_ENDPOINT_SIZE,
-    .bDescriptorType = USB_DT_ENDPOINT,
-    .bEndpointAddress = 0x83, // In
-    .bmAttributes = USB_ENDPOINT_ATTR_INTERRUPT,
-    .wMaxPacketSize = 16,
-    .bInterval = 255,
-}};
-
-static const struct usb_endpoint_descriptor acm_data_endp[] = {{
-    .bLength = USB_DT_ENDPOINT_SIZE,
-    .bDescriptorType = USB_DT_ENDPOINT,
-    .bEndpointAddress = 0x01, // Out
-    .bmAttributes = USB_ENDPOINT_ATTR_BULK,
-    .wMaxPacketSize = 64,
-    .bInterval = 1,
-}, {
-    .bLength = USB_DT_ENDPOINT_SIZE,
-    .bDescriptorType = USB_DT_ENDPOINT,
-    .bEndpointAddress = 0x82, // In
-    .bmAttributes = USB_ENDPOINT_ATTR_BULK,
-    .wMaxPacketSize = 64,
-    .bInterval = 1,
-}};
-
 static const struct usb_endpoint_descriptor ecm_comm_endp[] = {{
     .bLength = USB_DT_ENDPOINT_SIZE,
     .bDescriptorType = USB_DT_ENDPOINT,
-    .bEndpointAddress = 0x86, // In
+    .bEndpointAddress = CDC_ECM_NOTIFY_EP, // In
     .bmAttributes = USB_ENDPOINT_ATTR_INTERRUPT,
     .wMaxPacketSize = 16,
-    .bInterval = 255,
+    // .bInterval = 255,
+    .bInterval = 4 // Making it 4 like Blackberry
 }};
 
 static const struct usb_endpoint_descriptor ecm_data_endp[] = {{
     .bLength = USB_DT_ENDPOINT_SIZE,
     .bDescriptorType = USB_DT_ENDPOINT,
-    .bEndpointAddress = 0x85, // In
+    .bEndpointAddress = CDC_ECM_DATA_IN_EP, // In
     .bmAttributes = USB_ENDPOINT_ATTR_BULK,
     .wMaxPacketSize = 64,
-    .bInterval = 1,
+    // .bInterval = 1,
+    .bInterval = 0 // Making it 0 like Blackberry
 
 }, {
     .bLength = USB_DT_ENDPOINT_SIZE,
     .bDescriptorType = USB_DT_ENDPOINT,
-    .bEndpointAddress = 0x04, // Out
+    .bEndpointAddress = CDC_ECM_DATA_OUT_EP, // Out
     .bmAttributes = USB_ENDPOINT_ATTR_BULK,
     .wMaxPacketSize = 64,
-    .bInterval = 1,
+    // .bInterval = 1,
+    .bInterval = 0 // Making it 0 like Blackberry
 }};
-
-static const struct {
-    struct usb_cdc_header_descriptor header;
-    struct usb_cdc_call_management_descriptor call_mgmt;
-    struct usb_cdc_acm_descriptor acm;
-    struct usb_cdc_union_descriptor cdc_union;
-} __attribute__((packed)) cdcacm_interface_functional_descriptors = {
-    .header = {
-        .bFunctionLength = sizeof(struct usb_cdc_header_descriptor),
-        .bDescriptorType = CS_INTERFACE,
-        .bDescriptorSubtype = USB_CDC_TYPE_HEADER,
-        .bcdCDC = 0x0110,
-    },
-    .call_mgmt = {
-        .bFunctionLength =
-            sizeof(struct usb_cdc_call_management_descriptor),
-        .bDescriptorType = CS_INTERFACE,
-        .bDescriptorSubtype = USB_CDC_TYPE_CALL_MANAGEMENT,
-        .bmCapabilities = 0,
-        .bDataInterface = 1,
-    },
-    .acm = {
-        .bFunctionLength = sizeof(struct usb_cdc_acm_descriptor),
-        .bDescriptorType = CS_INTERFACE,
-        .bDescriptorSubtype = USB_CDC_TYPE_ACM,
-        .bmCapabilities = 6,
-    },
-    .cdc_union = {
-        .bFunctionLength = sizeof(struct usb_cdc_union_descriptor),
-        .bDescriptorType = CS_INTERFACE,
-        .bDescriptorSubtype = USB_CDC_TYPE_UNION,
-        .bControlInterface = 0,
-        .bSubordinateInterface0 = 1,
-     }
-};
 
 static const struct {
     struct usb_cdc_header_descriptor header;
@@ -205,8 +176,8 @@ static const struct {
         .bFunctionLength = sizeof(struct usb_cdc_union_descriptor),
         .bDescriptorType = CS_INTERFACE,
         .bDescriptorSubtype = USB_CDC_TYPE_UNION,
-        .bControlInterface = 2,
-        .bSubordinateInterface0 = 3,
+        .bControlInterface = CDC_ECM_COMM_INTERFACE_NUM,
+        .bSubordinateInterface0 = CDC_ECM_DATA_INTERFACE_NUM,
      },
      .ecm = {
          .bFunctionLength = sizeof(struct usb_cdc_ecm_descriptor),
@@ -221,42 +192,10 @@ static const struct {
 };
 
 
-static const struct usb_interface_descriptor acm_comm_iface[] = {{
-    .bLength = USB_DT_INTERFACE_SIZE,
-    .bDescriptorType = USB_DT_INTERFACE,
-    .bInterfaceNumber = 0,
-    .bAlternateSetting = 0,
-    .bNumEndpoints = 1, // Should be 1
-    .bInterfaceClass = USB_CLASS_CDC,
-    .bInterfaceSubClass = USB_CDC_SUBCLASS_ACM,
-    .bInterfaceProtocol = USB_CDC_PROTOCOL_AT,
-    .iInterface = 0,
-
-    .endpoint = acm_comm_endp,
-
-    .extra = &cdcacm_interface_functional_descriptors,
-    .extralen = sizeof(cdcacm_interface_functional_descriptors)
-}};
-
-static const struct usb_interface_descriptor acm_data_iface[] = {{
-    .bLength = USB_DT_INTERFACE_SIZE,
-    .bDescriptorType = USB_DT_INTERFACE,
-    .bInterfaceNumber = 1,
-    .bAlternateSetting = 0,
-    .bNumEndpoints = 2, // Should be 2
-    .bInterfaceClass = USB_CLASS_DATA,
-    .bInterfaceSubClass = 0,
-    .bInterfaceProtocol = 0,
-    .iInterface = 0,
-
-    .endpoint = acm_data_endp,
-}};
-
-
 static const struct usb_interface_descriptor ecm_comm_iface[] = {{
     .bLength = USB_DT_INTERFACE_SIZE,
     .bDescriptorType = USB_DT_INTERFACE,
-    .bInterfaceNumber = 2,
+    .bInterfaceNumber = CDC_ECM_COMM_INTERFACE_NUM,
     .bAlternateSetting = 0,
     .bNumEndpoints = 1,
     .bInterfaceClass = USB_CLASS_CDC,
@@ -274,54 +213,46 @@ static const struct usb_interface_descriptor ecm_data_iface[] = {
     {
         .bLength = USB_DT_INTERFACE_SIZE,
         .bDescriptorType = USB_DT_INTERFACE,
-        .bInterfaceNumber = 3,
+        .bInterfaceNumber = CDC_ECM_DATA_INTERFACE_NUM,
         .bAlternateSetting = 0,
         .bNumEndpoints = 0,
         .bInterfaceClass = USB_CLASS_DATA,
         .bInterfaceSubClass = 0,
         .bInterfaceProtocol = 0,
         .iInterface = 6,
+        .extra = NULL,
+        .extralen = 0,
     },
     {
         .bLength = USB_DT_INTERFACE_SIZE,
         .bDescriptorType = USB_DT_INTERFACE,
-        .bInterfaceNumber = 3,
+        .bInterfaceNumber = CDC_ECM_DATA_INTERFACE_NUM,
         .bAlternateSetting = 1,
         .bNumEndpoints = 2,
         .bInterfaceClass = USB_CLASS_DATA,
         .bInterfaceSubClass = 0,
         .bInterfaceProtocol = 0,
         .iInterface = 7,
+        .extra = NULL,
+        .extralen = 0,
         .endpoint = ecm_data_endp,
     }
 };
 
-static const struct usb_interface ifaces[] = {
-    {
-    .num_altsetting = 1,
-    .altsetting = acm_comm_iface,
-    },
-    {
-    .num_altsetting = 1,
-    .altsetting = acm_data_iface,
-    },
-    {
-    .num_altsetting = 1,
-    .altsetting = ecm_comm_iface,
-    },
-    {
-    .num_altsetting = 2,
-    .altsetting = ecm_data_iface,
-    }
-};
+
+// Must be defined to be allocated
+// This is needed to store the current altsetting in case of more than one is defined
+uint8_t ecm_data_iface_cur_altsetting = 0;
 
 static const struct usb_interface ecm_ifaces[] = {
     {
     .num_altsetting = 1,
+    .cur_altsetting = NULL,
     .altsetting = ecm_comm_iface,
     },
     {
     .num_altsetting = 2,
+    .cur_altsetting = &ecm_data_iface_cur_altsetting,
     .altsetting = ecm_data_iface,
     }
 };
@@ -329,14 +260,12 @@ static const struct usb_interface ecm_ifaces[] = {
 static const struct usb_config_descriptor config = {
     .bLength = USB_DT_CONFIGURATION_SIZE,
     .bDescriptorType = USB_DT_CONFIGURATION,
-    .wTotalLength = 0,
-    .bNumInterfaces = 2, // Should be 4
+    .wTotalLength = 0, // Can be anything, it is updated automatically when the usb code prepares the descriptor
+    .bNumInterfaces = 2, // CDC control, data
     .bConfigurationValue = 1,
     .iConfiguration = 0,
-    .bmAttributes = 0x80,
+    .bmAttributes = 0x80, // Bus powered
     .bMaxPower = 0x32,
-
-    // .interface = ifaces, //TODO
     .interface = ecm_ifaces
 };
 
@@ -370,36 +299,51 @@ void udelay_busy(uint32_t usecs)
 /* Buffer to be used for control requests. */
 static uint8_t usbd_control_buffer[128];
 
-//TODO: Should I add cases for ECM specific controll requests (ECM document 6.2), e.g. SetEthernetPacketFilter ?
-static enum usbd_request_return_codes cdcacm_control_request(usbd_device *usbd_dev, struct usb_setup_data *req, uint8_t **buf,
+//TODO: Add cases for ECM specific controll requests (ECM document 6.2), e.g. SetEthernetPacketFilter ?
+static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev, struct usb_setup_data *req, uint8_t **buf,
         uint16_t *len, void (**complete)(usbd_device *usbd_dev, struct usb_setup_data *req))
 {
     (void)complete;
     (void)buf;
     (void)usbd_dev;
 
-    switch(req->bRequest) {
-    case USB_CDC_REQ_SET_CONTROL_LINE_STATE: {
-        g_usbd_is_connected = req->wValue & 1; /* Check RTS bit */
-        if (!g_usbd_is_connected) /* Note: GPIO polarity is inverted */
-            gpio_set(LED_GREEN_PORT, LED_GREEN_PIN);
-        else
-            gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN);
-        return USBD_REQ_HANDLED;
-        }
-    case USB_CDC_REQ_SET_LINE_CODING: 
-        if(*len < sizeof(struct usb_cdc_line_coding))
-            return 0;
+    gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN); // TODO: Light the Green LED for debug
 
-        return USBD_REQ_HANDLED;
+    switch(req->bRequest) {
+        /*
+        case USB_CDC_REQ_SET_CONTROL_LINE_STATE: {
+            g_usbd_is_connected = req->wValue & 1; // Check RTS bit
+            if (!g_usbd_is_connected) // Note: GPIO polarity is inverted
+                gpio_set(LED_GREEN_PORT, LED_GREEN_PIN);
+            else
+                gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN);
+            return USBD_REQ_HANDLED;
+            }
+        break;
+        case USB_CDC_REQ_SET_LINE_CODING: 
+            if (*len < sizeof(struct usb_cdc_line_coding))
+                return 0;
+            return USBD_REQ_HANDLED;        
+        break;
+        */
+        case USB_CDC_REQ_SET_ETHERNET_MULTICAST_FILTERS:
+        case USB_CDC_REQ_SET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER:
+        case USB_CDC_REQ_GET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER:
+        case USB_CDC_REQ_GET_ETHERNET_STATISTIC:
+            return USBD_REQ_NOTSUPP;
+        break;
+        case USB_CDC_REQ_SET_ETHERNET_PACKET_FILTER:
+            return USBD_REQ_HANDLED;
+        break;
     }
+    
     return 0;
 }
 
-//TODO: Copy the better shell, from opticspy or pwm-shell?
 //TODO: Might not be needed, not commmands to control ECM. Maybe set IP and restart?
 
 /* Simple callback that echoes whatever is sent */
+/*
 static void cdcacm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 {
     (void)ep;
@@ -417,20 +361,27 @@ static void cdcacm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
         buf[len] = 0;
     }
 }
+*/
 
-static void usb_puts(char *s);
+//static void usb_puts(char *s);
 
 static void cdcecm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 {
     (void)ep;
+    (void)usbd_dev;
 
+
+    gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN); // TODO: Light the Green LED for debug
+
+/*
     char buf[64];
     int len = usbd_ep_read_packet(usbd_dev, 0x04, buf, sizeof(buf)); //TODO: Hardcoded 0x04 ECM Data Out endpoint (from Host)
-
+*/
     // TODO: keep reading until no more bulk data, or packet is 1514, and save to gloval packet buffer
     // TODO: How do I know the bulk transaction ended? See USB CDC ECM document, section 3.3.1 Segment Delineation
     // TODO: Basically, the last packet will be < 64. If the frame is a multiple of 64, there will be a zero-length packet.
 
+    /*
     if (len == 64) {
         usb_puts("\r\nReceived full bulk packet");
        	udelay_busy(USB_PUTS_DELAY_USEC);
@@ -442,7 +393,7 @@ static void cdcecm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
         usb_puts(string_buffer);
    	    udelay_busy(USB_PUTS_DELAY_USEC);
     }
-    
+    */
 
     // TODO: Convert the data from binary to hex string and write to CDC ACM Data In endpoint
     // TODO: Write the Ethernet packet we received, no more than 64 bytes at a time since the endpoint buffer is 64
@@ -450,33 +401,85 @@ static void cdcecm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
  
 }
 
-static void cdcacm_set_config(usbd_device *usbd_dev, uint16_t wValue)
+static void cdc_altsetting_cc(usbd_device *usbd_dev, uint16_t wIndex, uint16_t wValue)
+{
+    (void)usbd_dev;
+
+    gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN); // TODO: Light the Green LED for debug
+
+    if (wIndex != CDC_ECM_DATA_INTERFACE_NUM) {
+        return;
+    }
+
+    if (wValue != 1) {
+        return;
+    }
+
+
+    // Set alternate ECM data interface
+
+    // gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN); // TODO: Light the Green LED for debug
+
+    struct usb_cdc_notification_header notify_buf;
+    notify_buf.bmRequestType = 0xA1; // TODO: Not magic number
+    notify_buf.wIndex = wIndex;
+    // TODO: Send a notification for NetworkConnection + ConnectionSpeedChange
+    // TODO: See CDC doc 6.3.1
+    notify_buf.bNotificationCode = USB_CDC_ECM_NOTIFICATION_NETWORK_CONNECTION;
+    notify_buf.wLength = 0;        
+    notify_buf.wValue = 1; // 1 = Connected, 0 = Disconnected.
+    usbd_ep_write_packet(g_usbd_dev, 0x86, &notify_buf, sizeof(notify_buf));
+    
+    udelay_busy(1000); // TODO: Needed?
+
+    struct usb_cdc_notification_speed_change notify_speed_change;
+    notify_speed_change.notify_header.bmRequestType = 0xA1; // TODO: Not magic number
+    notify_speed_change.notify_header.bNotificationCode = USB_CDC_ECM_NOTIFICATION_CONNECTION_SPEED_CHANGE;
+    notify_speed_change.notify_header.wIndex = wIndex;
+    notify_speed_change.notify_header.wValue = 0;
+    notify_speed_change.notify_header.wLength = 8;
+    notify_speed_change.dlbitrate = 10000000; // 10 Mbps
+    notify_speed_change.ulbitrate = 10000000; // 10 Mbps
+    usbd_ep_write_packet(g_usbd_dev, 0x86, &notify_speed_change, sizeof(notify_speed_change));
+
+    return;
+}
+
+
+static void cdc_set_config(usbd_device *usbd_dev, uint16_t wValue)
 {
     (void)wValue;
 
-    // TODO: Use #define for endpoint constants
+    usbd_ep_setup(usbd_dev, CDC_ECM_NOTIFY_EP, USB_ENDPOINT_ATTR_INTERRUPT, 16, 0);
+    usbd_ep_setup(usbd_dev, CDC_ECM_DATA_OUT_EP, USB_ENDPOINT_ATTR_BULK, 64, cdcecm_data_rx_cb);
+    usbd_ep_setup(usbd_dev, CDC_ECM_DATA_IN_EP, USB_ENDPOINT_ATTR_BULK, 64, 0);
+    
+    usbd_register_set_altsetting_callback(g_usbd_dev, cdc_altsetting_cc);
 
-    usbd_ep_setup(usbd_dev, 0x01, USB_ENDPOINT_ATTR_BULK, 64, cdcacm_data_rx_cb);
-    usbd_ep_setup(usbd_dev, 0x82, USB_ENDPOINT_ATTR_BULK, 64, 0);
-    usbd_ep_setup(usbd_dev, 0x83, USB_ENDPOINT_ATTR_INTERRUPT, 16, 0);
+    // The specified callback will be called if (type == (bmRequestType & type_mask)).
 
-    usbd_ep_setup(usbd_dev, 0x04, USB_ENDPOINT_ATTR_BULK, 64, cdcecm_data_rx_cb);
-    usbd_ep_setup(usbd_dev, 0x85, USB_ENDPOINT_ATTR_BULK, 64, 0);
-    usbd_ep_setup(usbd_dev, 0x86, USB_ENDPOINT_ATTR_INTERRUPT, 16, 0);
-
+    //TODO: Add CDC ECM codes if applies here
     usbd_register_control_callback(
                 usbd_dev,
                 USB_REQ_TYPE_CLASS | USB_REQ_TYPE_INTERFACE,
                 USB_REQ_TYPE_TYPE | USB_REQ_TYPE_RECIPIENT,
-                cdcacm_control_request);
+                cdc_control_request);
+
+    usbd_register_control_callback(
+                usbd_dev,
+                USB_REQ_TYPE_IN | USB_REQ_TYPE_CLASS | USB_REQ_TYPE_INTERFACE,
+                USB_REQ_TYPE_DIRECTION | USB_REQ_TYPE_TYPE | USB_REQ_TYPE_RECIPIENT,
+                cdc_control_request);
 }
 
 
+/*
 static void usb_puts(char *s) {
     if (g_usbd_is_connected) {
         usbd_ep_write_packet(g_usbd_dev, 0x82, s, strnlen(s, 64));
     }
 }
+*/
 
 void usb_isr(void)
 {
@@ -490,7 +493,7 @@ void hard_fault_handler(void)
 
 int main(void)
 {
-    bool line_was_connected = false;
+    // bool line_was_connected = false;
 
     /* Disable the watchdog that the bootloader started. */
     WDOG_CTRL = 0;
@@ -504,9 +507,10 @@ int main(void)
 
     /* Configure the USB core & stack */
     g_usbd_dev = usbd_init(&efm32hg_usb_driver, &dev, &config, usb_strings, NUM_USB_STRINGS, usbd_control_buffer, sizeof(usbd_control_buffer));
-    usbd_register_set_config_callback(g_usbd_dev, cdcacm_set_config);
-
-    //TODO: Add a call to usbd_register_set_altsetting_callback, and implement a callback to just print which interface + altsetting was selected
+    usbd_register_set_altsetting_callback(g_usbd_dev, cdc_altsetting_cc);
+    usbd_register_set_config_callback(g_usbd_dev, cdc_set_config);
+    
+    cdc_set_config(g_usbd_dev, 0); // TODO: This is pointless
 
     /* Set the CPU Core to run from the trimmed USB clock, divided by 2.
      * This will give the CPU Core a frequency of 24 MHz +/- 1% */
@@ -518,6 +522,8 @@ int main(void)
     nvic_enable_irq(NVIC_USB_IRQ);
 
     while(1) {
+
+        /*
         if (line_was_connected != g_usbd_is_connected) {
             if (g_usbd_is_connected) {
                 udelay_busy(2000);
@@ -526,10 +532,11 @@ int main(void)
             }
             line_was_connected = g_usbd_is_connected;
         }
+        */
 
         // TODO: Remove this, find another use for the LEDs
-        usb_puts("toggling LED\n\r");            
+        // usb_puts("toggling LED\n\r");            
         gpio_toggle(LED_RED_PORT, LED_RED_PIN);  
-        udelay_busy(300000);
+        udelay_busy(500000);
     }
 }
