@@ -93,11 +93,6 @@ TOBOOT_CONFIGURATION(0);
 #define CDC_ACM_COMM_INTERFACE_NUM 2
 #define CDC_ACM_DATA_INTERFACE_NUM 3
 
-//TODO: Experiment
-// #define CDC_ACM_COMM_INTERFACE_NUM 0
-// #define CDC_ACM_DATA_INTERFACE_NUM 1
-
-
 struct usb_cdc_notification_header {
 	uint8_t bmRequestType;
 	uint8_t bNotificationCode;
@@ -128,6 +123,9 @@ struct usb_cdc_ecm_descriptor {
 static volatile bool g_usbd_is_connected = false;
 static usbd_device *g_usbd_dev = 0;
 
+static volatile uint16_t g_frame_len = 0;
+static uint8_t g_ethernet_frame[1514];
+
 static const struct usb_device_descriptor dev = {
 	.bLength = USB_DT_DEVICE_SIZE,
 	.bDescriptorType = USB_DT_DEVICE,
@@ -153,7 +151,7 @@ static const struct usb_endpoint_descriptor ecm_comm_endp[] = {{
 	.bmAttributes = USB_ENDPOINT_ATTR_INTERRUPT,
 	.wMaxPacketSize = 16,
 	// .bInterval = 255,
-	.bInterval = 4 // Making it 4 like Blackberry
+	.bInterval = 4 // TODO: Making it 4 like Blackberry
 }};
 
 static const struct usb_endpoint_descriptor ecm_data_endp[] = {{
@@ -163,7 +161,7 @@ static const struct usb_endpoint_descriptor ecm_data_endp[] = {{
 	.bmAttributes = USB_ENDPOINT_ATTR_BULK,
 	.wMaxPacketSize = 64,
 	// .bInterval = 1,
-	.bInterval = 0 // Making it 0 like Blackberry
+	.bInterval = 0 // TODO: Making it 0 like Blackberry
 
 }, {
 	.bLength = USB_DT_ENDPOINT_SIZE,
@@ -172,7 +170,7 @@ static const struct usb_endpoint_descriptor ecm_data_endp[] = {{
 	.bmAttributes = USB_ENDPOINT_ATTR_BULK,
 	.wMaxPacketSize = 64,
 	// .bInterval = 1,
-	.bInterval = 0 // Making it 0 like Blackberry
+	.bInterval = 0 // TODO: Making it 0 like Blackberry
 }};
 
  // This notification endpoint isn't implemented. According to CDC spec it is
@@ -541,6 +539,59 @@ static void usb_puts(char *s) {
 	}
 }
 
+static char nibble_to_hexchar(uint8_t nibble) {
+	if (nibble < 10) {
+		return (char) (nibble + '0');
+	} else if (nibble < 16) {
+		return (char) (nibble - 10 + 'A');
+	} else {
+		return 'X';
+	}
+}
+
+static void buf_to_hexstring(uint8_t* source, char* dest, unsigned int start_index, unsigned int end_index) {
+	for (unsigned int current_byte_index = start_index; current_byte_index <= end_index; ++current_byte_index) {
+		dest[(current_byte_index - start_index)*2] = nibble_to_hexchar(source[current_byte_index] >> 4); // MSB nibble
+		dest[(current_byte_index - start_index)*2 + 1] = nibble_to_hexchar(source[current_byte_index] & 0xF); // LSB nibble
+	}
+}
+
+static void handle_ethernet_frame() {
+
+	char len_string[5];
+	itoa(g_frame_len, len_string, 10);
+
+	usb_puts("\r\nFrame len: ");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+	
+	usb_puts(len_string);
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+
+	usb_puts("\r\nData: ");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+
+	// For each byte, we write 2 Hex chars.
+	// We can only print 64 chars so we read 32 bytes at a time.
+
+	char char_buf[64];
+
+	uint8_t print_len;
+	for (unsigned int start_index = 0; start_index < g_frame_len; start_index+=32) {
+		if ((g_frame_len - start_index) >= 32) {
+			print_len = 32;
+		} else {
+			print_len = (g_frame_len - start_index); // Print only remaining bytes
+			char_buf[print_len*2] = '\0'; // Null terminate, for usb_puts strnlen.
+		}
+		buf_to_hexstring(g_ethernet_frame, char_buf, start_index, start_index + print_len - 1);
+		usb_puts(char_buf);
+		udelay_busy(USB_PUTS_DELAY_USEC);
+	}
+
+	g_frame_len = 0;
+}
+
 static void cdcecm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 {
 	(void)ep;
@@ -548,35 +599,50 @@ static void cdcecm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 
 	gpio_toggle(LED_RED_PORT, LED_RED_PIN); // TODO: Light the Red LED for debug
 
-	usb_puts("\r\nECM Data Rx");
+	uint8_t packet_buf[64];
+	uint16_t len = usbd_ep_read_packet(usbd_dev, CDC_ECM_DATA_OUT_EP, packet_buf, sizeof(packet_buf));
+
+
+	char packet_len_buf[3];
+
+	usb_puts("\r\nLen: ");
+	udelay_busy(USB_PUTS_DELAY_USEC);
+	itoa(len, packet_len_buf, 10);
+	usb_puts(packet_len_buf);
 	udelay_busy(USB_PUTS_DELAY_USEC);
 
+	// See USB CDC ECM document, section 3.3.1 Segment Delineation.
+	// Basically, the last packet will be < 64. If the frame is a multiple of 64, there will be a zero-length packet.
 
-/*
-	char buf[64];
-	int len = usbd_ep_read_packet(usbd_dev, 0x04, buf, sizeof(buf)); //TODO: Hardcoded 0x04 ECM Data Out endpoint (from Host)
-*/
-	// TODO: keep reading until no more bulk data, or packet is 1514, and save to gloval packet buffer
-	// TODO: How do I know the bulk transaction ended? See USB CDC ECM document, section 3.3.1 Segment Delineation
-	// TODO: Basically, the last packet will be < 64. If the frame is a multiple of 64, there will be a zero-length packet.
-
-	/*
-	if (len == 64) {
-		usb_puts("\r\nReceived full bulk packet");
-	   	udelay_busy(USB_PUTS_DELAY_USEC);
-	} else {
-		usb_puts("\r\nReceived bulk packet size ");
-	   	udelay_busy(USB_PUTS_DELAY_USEC);
-		char string_buffer[3];
-		itoa(len, string_buffer, 10);
-		usb_puts(string_buffer);
-   		udelay_busy(USB_PUTS_DELAY_USEC);
+	if (len == 0) { // Zero-length packet
+		if (g_frame_len) { // Frame has data
+			handle_ethernet_frame();			
+		} else {
+			usb_puts("\r\nUnexpected 0-len packet");
+			udelay_busy(USB_PUTS_DELAY_USEC);
+		}
+		return;
 	}
-	*/
 
-	// TODO: Convert the data from binary to hex string and write to CDC ACM Data In endpoint
+	if ((g_frame_len + len) > (sizeof(g_ethernet_frame))) {
+		g_frame_len = 0; // Drop frame data
+		usb_puts("\r\nError: Frame overflow");
+		udelay_busy(USB_PUTS_DELAY_USEC);	
+	}
+	
+	memcpy(g_ethernet_frame + g_frame_len, packet_buf, len);
+	g_frame_len+=len;
+	if (len < 64) { // Last packet in a frame
+		handle_ethernet_frame();
+		return;
+	}
+
+	return;
+//TODO: This function might be too long for the USB interrupt, with all the delays
+//TODO: I might need to add locking, or double-buffer the Ethernet frame buf
+
 	// TODO: Write the Ethernet packet we received, no more than 64 bytes at a time since the endpoint buffer is 64
-	// usbd_ep_write_packet(usbd_dev, 0x82, epbuf, len); //TODO: Hardcoded 0x82 ACM Data In endpoint (to Host)
+	// usbd_ep_write_packet(usbd_dev, CDC_ACM_DATA_IN_EP, epbuf, len);
  
 }
 
@@ -710,9 +776,8 @@ int main(void)
 			line_was_connected = g_usbd_is_connected;
 		}
 
-		// TODO: Remove this, find another use for the LEDs
-		usb_puts("Beep3\n\r");            
-		// gpio_toggle(LED_RED_PORT, LED_RED_PIN);  
-		udelay_busy(500000);
+		// TODO: Remove this
+		// usb_puts("Beep4\n\r");
+		// udelay_busy(2000000);
 	}
 }
