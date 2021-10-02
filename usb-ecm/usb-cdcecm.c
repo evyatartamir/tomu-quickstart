@@ -69,7 +69,7 @@ TOBOOT_CONFIGURATION(0);
 #define USB_CDC_DESCRIPTOR_SUBTYPE_ETHERNET 0x0F 
 
 #define USB_CDC_REQ_SET_ETHERNET_PACKET_FILTER 0x43 // Required by ECM standard
-// TODO: These are optional
+// Optional ECM requests
 #define USB_CDC_REQ_SET_ETHERNET_MULTICAST_FILTERS 0x40
 #define USB_CDC_REQ_SET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER 0x41
 #define USB_CDC_REQ_GET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER 0x42
@@ -81,9 +81,12 @@ TOBOOT_CONFIGURATION(0);
 
 #define CDC_ECM_DATA_OUT_EP 0x01
 #define CDC_ECM_DATA_IN_EP 0x81
-// TODO: EFM32HG only supports 3 IN Endpoints, and I need CDC ACM Nofitication, CDC ACM Data, ECM Data.
-// TODO: Add #ifdef. If CDC ACM is removed, I can add this optional notification EP for CDC ECM.
+// EFM32HG only supports 3 IN Endpoints, and I need CDC ACM Nofitication (IN), CDC ACM Data (IN, OUT), ECM Data (IN, OUT).
+// If CDC ACM is removed, this optional notification EP for CDC ECM can be defined.
+#ifdef USE_CDC_ECM_NOTIFY_ENDPOINT
 #define CDC_ECM_NOTIFY_EP 0x83
+#endif
+
 #define CDC_ACM_DATA_OUT_EP 0x02
 #define CDC_ACM_DATA_IN_EP 0x82
 #define CDC_ACM_NOTIFY_EP 0x83
@@ -144,15 +147,16 @@ static const struct usb_device_descriptor dev = {
 	.bNumConfigurations = 1,
 };
 
+#ifdef USE_CDC_ECM_NOTIFY_ENDPOINT
 static const struct usb_endpoint_descriptor ecm_comm_endp[] = {{
 	.bLength = USB_DT_ENDPOINT_SIZE,
 	.bDescriptorType = USB_DT_ENDPOINT,
 	.bEndpointAddress = CDC_ECM_NOTIFY_EP, // In
 	.bmAttributes = USB_ENDPOINT_ATTR_INTERRUPT,
 	.wMaxPacketSize = 16,
-	// .bInterval = 255,
-	.bInterval = 4 // TODO: Making it 4 like Blackberry
+	.bInterval = 255,	
 }};
+#endif
 
 static const struct usb_endpoint_descriptor ecm_data_endp[] = {{
 	.bLength = USB_DT_ENDPOINT_SIZE,
@@ -271,14 +275,21 @@ static const struct usb_interface_descriptor ecm_comm_iface[] = {{
 	.bDescriptorType = USB_DT_INTERFACE,
 	.bInterfaceNumber = CDC_ECM_COMM_INTERFACE_NUM,
 	.bAlternateSetting = 0,
-	.bNumEndpoints = 0, // TODO: When CDC is removed, this should be 1
+	#ifdef USE_CDC_ECM_NOTIFY_ENDPOINT
+	.bNumEndpoints = 1,
+	#else
+	.bNumEndpoints = 0,
+	#endif
 	.bInterfaceClass = USB_CLASS_CDC,
 	.bInterfaceSubClass = USB_CDC_INTERFACE_SUBCLASS_ECM,
 	.bInterfaceProtocol = 0x0,
 	.iInterface = 5,
 
-	// .endpoint = ecm_comm_endp, // TODO: #ifdef no ACM, not enough endpoints
+	#ifdef USE_CDC_ECM_NOTIFY_ENDPOINT
+	.endpoint = ecm_comm_endp,
+	#else
 	.endpoint = NULL,
+	#endif
 
 	.extra = &cdcecm_interface_functional_descriptors,
 	.extralen = sizeof(cdcecm_interface_functional_descriptors)
@@ -351,6 +362,7 @@ static const struct usb_interface_descriptor acm_data_iface[] = {{
 // This is needed to store the current altsetting in case of more than one is defined
 uint8_t ecm_data_iface_cur_altsetting = 0;
 
+/*
 static const struct usb_interface ecm_ifaces[] = {
 	{
 	.num_altsetting = 1,
@@ -376,6 +388,7 @@ static const struct usb_interface acm_ifaces[] = {
 	.altsetting = acm_data_iface,
 	}
 };
+*/
 
 static const struct usb_interface ecm_acm_ifaces[] = {
 	{
@@ -400,6 +413,7 @@ static const struct usb_interface ecm_acm_ifaces[] = {
 	}
 };
 
+/*
 static const struct usb_config_descriptor ecm_config = {
 	.bLength = USB_DT_CONFIGURATION_SIZE,
 	.bDescriptorType = USB_DT_CONFIGURATION,
@@ -423,6 +437,7 @@ static const struct usb_config_descriptor acm_config = {
 	.bMaxPower = 0x32,
 	.interface = acm_ifaces
 };
+*/
 
 static const struct usb_config_descriptor ecm_acm_config = {
 	.bLength = USB_DT_CONFIGURATION_SIZE,
@@ -467,7 +482,6 @@ void udelay_busy(uint32_t usecs)
 /* Buffer to be used for control requests. */
 static uint8_t usbd_control_buffer[128];
 
-//TODO: Add cases for ECM specific controll requests (ECM document 6.2), e.g. SetEthernetPacketFilter ?
 static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev, struct usb_setup_data *req, uint8_t **buf,
 		uint16_t *len, void (**complete)(usbd_device *usbd_dev, struct usb_setup_data *req))
 {
@@ -494,7 +508,8 @@ static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev,
 				return USBD_REQ_NOTSUPP;
 			return USBD_REQ_HANDLED;        
 		break;
-		
+
+		// ECM control requests (ECM document, section 6.2)		
 		case USB_CDC_REQ_SET_ETHERNET_MULTICAST_FILTERS:
 		case USB_CDC_REQ_SET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER:
 		case USB_CDC_REQ_GET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER:
@@ -509,9 +524,7 @@ static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev,
 	return USBD_REQ_NOTSUPP;
 }
 
-//TODO: Might not be needed, not commmands to control ECM. Maybe set IP and restart?
-
-// Simple callback that echoes whatever is sent
+// CDC Data callback that echoes whatever is sent
 static void cdcacm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 {
 	(void)ep;	
@@ -558,6 +571,9 @@ static void buf_to_hexstring(uint8_t* source, char* dest, unsigned int start_ind
 
 static void handle_ethernet_frame() {
 
+//TODO: This function might be too long for the USB interrupt, with all the delays
+//TODO: I might need to add locking, or double-buffer the Ethernet frame buf
+
 	char len_string[5];
 	itoa(g_frame_len, len_string, 10);
 
@@ -572,7 +588,7 @@ static void handle_ethernet_frame() {
 	udelay_busy(USB_PUTS_DELAY_USEC);
 
 	// For each byte, we write 2 Hex chars.
-	// We can only print 64 chars so we read 32 bytes at a time.
+	// We can only print 64 chars at a time, so we read 32 bytes.
 
 	char char_buf[64];
 
@@ -638,14 +654,9 @@ static void cdcecm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 	}
 
 	return;
-//TODO: This function might be too long for the USB interrupt, with all the delays
-//TODO: I might need to add locking, or double-buffer the Ethernet frame buf
-
-	// TODO: Write the Ethernet packet we received, no more than 64 bytes at a time since the endpoint buffer is 64
-	// usbd_ep_write_packet(usbd_dev, CDC_ACM_DATA_IN_EP, epbuf, len);
- 
 }
 
+#ifdef USE_CDC_ECM_NOTIFY_ENDPOINT
 static void cdc_altsetting_cc(usbd_device *usbd_dev, uint16_t wIndex, uint16_t wValue)
 {
 	(void)usbd_dev;
@@ -659,11 +670,7 @@ static void cdc_altsetting_cc(usbd_device *usbd_dev, uint16_t wIndex, uint16_t w
 	}
 
 	// Set alternate ECM data interface
-
-	// TODO: If I remove the optional notification endpoint, this can be removed as well.
-	return; // TODO: #ifdef no ACM
-	// TODO: Add #ifdef to enable/disable the ECM notification endpoint
-
+	
 	struct usb_cdc_notification_header notify_buf;
 	notify_buf.bmRequestType = 0xA1; // TODO: Not magic number
 	notify_buf.wIndex = wIndex;
@@ -688,14 +695,17 @@ static void cdc_altsetting_cc(usbd_device *usbd_dev, uint16_t wIndex, uint16_t w
 
 	return;
 }
+#endif
 
 
 static void cdc_set_config(usbd_device *usbd_dev, uint16_t wValue)
 {
 	(void)wValue;
 
-	// usbd_ep_setup(usbd_dev, CDC_ECM_NOTIFY_EP, USB_ENDPOINT_ATTR_INTERRUPT, 16, 0);
-	// TODO: Restore
+	#ifdef USE_CDC_ECM_NOTIFY_ENDPOINT
+	usbd_ep_setup(usbd_dev, CDC_ECM_NOTIFY_EP, USB_ENDPOINT_ATTR_INTERRUPT, 16, 0);
+	#endif
+
 	usbd_ep_setup(usbd_dev, CDC_ECM_DATA_OUT_EP, USB_ENDPOINT_ATTR_BULK, 64, cdcecm_data_rx_cb);
 	usbd_ep_setup(usbd_dev, CDC_ECM_DATA_IN_EP, USB_ENDPOINT_ATTR_BULK, 64, 0);
 
@@ -703,18 +713,17 @@ static void cdc_set_config(usbd_device *usbd_dev, uint16_t wValue)
 	usbd_ep_setup(usbd_dev, CDC_ACM_DATA_IN_EP, USB_ENDPOINT_ATTR_BULK, 64, 0);
 	usbd_ep_setup(usbd_dev, CDC_ACM_NOTIFY_EP, USB_ENDPOINT_ATTR_INTERRUPT, 16, 0);
 
-	// TODO: Restore when adding ECM back, use #ifdef since it's only useful for notification
-	// usbd_register_set_altsetting_callback(g_usbd_dev, cdc_altsetting_cc);
+	#ifdef USE_CDC_ECM_NOTIFY_ENDPOINT
+	usbd_register_set_altsetting_callback(g_usbd_dev, cdc_altsetting_cc);
+	#endif
 
 	// The specified callback will be called if (type == (bmRequestType & type_mask)).
 
-	//TODO: Add CDC ECM codes if applies here
 	usbd_register_control_callback(
 				usbd_dev,
 				USB_REQ_TYPE_CLASS | USB_REQ_TYPE_INTERFACE,
 				USB_REQ_TYPE_TYPE | USB_REQ_TYPE_RECIPIENT,
 				cdc_control_request);
-//TODO: Restore for ECM control
 
 	usbd_register_control_callback(
 				usbd_dev,
