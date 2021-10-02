@@ -25,6 +25,7 @@
  * This example implements a USB CDC-ECM device (Ethernet NIC)
  *
  * TODO: Edit this text
+ * TODO: Also give credit to Silicon Labs AN032
  * When data is recieved, it will toggle the green LED and echo the data.
  * The red LED is toggled constantly and a string is sent over USB every
  * time the LED changes state as a heartbeat.
@@ -33,6 +34,7 @@
 #include <libopencm3/cm3/common.h>
 #include <libopencm3/cm3/vector.h>
 #include <libopencm3/cm3/scb.h>
+#include <libopencm3/cm3/systick.h>
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/usb/usbd.h>
 #include <libopencm3/usb/cdc.h>
@@ -50,8 +52,12 @@
 TOBOOT_CONFIGURATION(0);
 //TOBOOT_CONFIGURATION(TOBOOT_CONFIG_FLAG_AUTORUN); // Uncomment to boot directly to this app, instead of the DFU bootloader.
 
-/* Default AHB (core clock) frequency of Tomu board */
-//#define AHB_FREQUENCY 14000000
+/* Systick interrupt frequency, Hz */
+#define SYSTICK_FREQUENCY 1000
+
+/* USB (core clock) frequency of Tomu board */
+#define USB_CLK_FREQUENCY 24000000
+
 
 #define LED_GREEN_PORT GPIOA
 #define LED_GREEN_PIN  GPIO0
@@ -744,6 +750,20 @@ void hard_fault_handler(void)
 	while(1);
 }
 
+void sys_tick_handler(void)
+{	
+	// TODO: Service LWIP timers
+
+	static uint16_t tick_counter = 0;
+
+	if (tick_counter >= 5000) { // Every 5 seconds
+		usb_puts("\r\nSysTick\r\n");
+		tick_counter = 0;
+	}
+	
+	++tick_counter;
+}
+
 int main(void)
 {
 	bool line_was_connected = false;
@@ -765,14 +785,23 @@ int main(void)
 	g_usbd_dev = usbd_init(&efm32hg_usb_driver, &dev, &ecm_acm_config, usb_strings, NUM_USB_STRINGS, usbd_control_buffer, sizeof(usbd_control_buffer));
 	usbd_register_set_config_callback(g_usbd_dev, cdc_set_config);
 	
+	// The call to usbd_init called efm32hg_usbd_init, which set up and enabled the USB clock.
+
 	/* Set the CPU Core to run from the trimmed USB clock, divided by 2.
 	 * This will give the CPU Core a frequency of 24 MHz +/- 1% */
-	CMU_CMD = (5 << 0);
-	while (! (CMU_STATUS & (1 << 26)))
+	CMU_CMD = CMU_CMD_HFCLKSEL(5);
+    while (! (CMU_STATUS & CMU_STATUS_USHFRCODIV2SEL))
 		;
 
 	/* Enable USB IRQs */
 	nvic_enable_irq(NVIC_USB_IRQ);
+
+    /* Configure the system tick, at lower priority than USB IRQ */
+    systick_set_frequency(SYSTICK_FREQUENCY, USB_CLK_FREQUENCY);
+    systick_counter_enable();
+    systick_interrupt_enable();
+    nvic_set_priority(NVIC_SYSTICK_IRQ, 0x10);
+
 
 	while(1) {
 		
