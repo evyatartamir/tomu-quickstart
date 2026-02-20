@@ -327,27 +327,22 @@ static void snake_setup(void)
         snakeTailX[i] = x - i;
         snakeTailY[i] = y;
     }
+
+	/* prevent any future garbage draw */
+    for (int i = snakeTailLen; i < 100; i++) {   /* or whatever your array size is */
+        snakeTailX[i] = -1;
+        snakeTailY[i] = -1;
+    }
 }
 
 static void snake_logic(void)
 {
     if (key == 0) return;
 
-    int prevX = snakeTailX[0];
-    int prevY = snakeTailY[0];
+    int prevX = x;
+    int prevY = y;
 
-    snakeTailX[0] = x;
-    snakeTailY[0] = y;
-
-    for (int i = 1; i < snakeTailLen; i++) {
-        int prev2X = snakeTailX[i];
-        int prev2Y = snakeTailY[i];
-        snakeTailX[i] = prevX;
-        snakeTailY[i] = prevY;
-        prevX = prev2X;
-        prevY = prev2Y;
-    }
-
+    /* move head */
     switch (key) {
         case 1: x--; break;  /* A */
         case 2: x++; break;  /* D */
@@ -355,23 +350,34 @@ static void snake_logic(void)
         case 4: y++; break;  /* S */
     }
 
+    /* wall */
     if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT) {
         gameover = 1;
         return;
     }
 
+    /* eat fruit FIRST — so the next link in the body has correct coordinates */
+    if (x == fruitx && y == fruity) {
+        score += 10;
+        snakeTailLen++;                     /* grow before shifting */
+        fruitx = 5 + simple_rand(WIDTH - 10);
+        fruity = 3 + simple_rand(HEIGHT - 6);
+    }
+
+    /* now shift body (new length already includes the growth) */
+    for (int i = snakeTailLen - 1; i > 0; i--) {
+        snakeTailX[i] = snakeTailX[i-1];
+        snakeTailY[i] = snakeTailY[i-1];
+    }
+    snakeTailX[0] = prevX;   /* old head becomes new body segment */
+    snakeTailY[0] = prevY;
+
+    /* self collision */
     for (int i = 0; i < snakeTailLen; i++) {
         if (snakeTailX[i] == x && snakeTailY[i] == y) {
             gameover = 1;
             return;
         }
-    }
-
-    if (x == fruitx && y == fruity) {
-        fruitx = 5 + simple_rand(WIDTH - 10);
-        fruity = 3 + simple_rand(HEIGHT - 6);
-        score += 10;
-        snakeTailLen++;
     }
 }
 
@@ -611,7 +617,8 @@ static void usb_puts_full(const char *s)
         usbd_ep_write_packet(g_usbd_dev, 0x82, (void*)(s + offset), chunk);
         offset += chunk;
 
-        udelay_busy(50);   /* tiny pause so the Happy Gecko USB engine can breathe — you already use udelay_busy */
+		udelay_busy(200);   /* <-- increased from 50 — this fixes PuTTY tearing */
+		// Without the delay the printout won't always be handled correctly in the terminal
     }
 }
 
