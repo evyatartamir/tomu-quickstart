@@ -299,6 +299,12 @@ static char screen_buf[1100];
 static char pending_snake_key = 0;
 int snake_need_redraw = 0;
 
+volatile uint32_t snake_ms_counter = 0;
+#define SNAKE_TICK_MS 200
+volatile bool snake_do_tick = false;
+volatile bool snake_flash_green = false;
+volatile bool snake_flash_red = false;
+
 static uint32_t prng_seed = 0xA5A5A5A5UL;
 
 static uint32_t simple_rand(uint32_t max)
@@ -353,6 +359,7 @@ static void snake_logic(void)
     /* wall */
     if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT) {
         gameover = 1;
+		snake_flash_red = true;
         return;
     }
 
@@ -360,6 +367,7 @@ static void snake_logic(void)
     if (x == fruitx && y == fruity) {
         score += 10;
         snakeTailLen++;                     /* grow before shifting */
+		snake_flash_green = true;
         fruitx = 5 + simple_rand(WIDTH - 10);
         fruity = 3 + simple_rand(HEIGHT - 6);
     }
@@ -376,6 +384,7 @@ static void snake_logic(void)
     for (int i = 0; i < snakeTailLen; i++) {
         if (snakeTailX[i] == x && snakeTailY[i] == y) {
             gameover = 1;
+			snake_flash_red = true;
             return;
         }
     }
@@ -449,30 +458,34 @@ static void snake_handle_key(char c)
         g_serial_echo_enabled = 1;
         g_new_command_len = 0;
         usb_puts("\r\n=== SNAKE QUIT ===\r\n");
-        return;   // only exits the *handler*, never main
+        snake_do_tick = false;
+        return;
     }
 
     if (gameover) {
-        // any non-X key after death = restart
         snake_setup();
         snake_need_redraw = 1;
         game_over_displayed = 0;
         gameover = 0;
+        snake_ms_counter = 0;
         return;
     }
 
     switch (c) {
-        case 'W': key = 3; break;
-        case 'A': key = 1; break;
-        case 'S': key = 4; break;
-        case 'D': key = 2; break;
+        case 'W': key = 3; break;  /* up */
+        case 'A': key = 1; break;  /* left */
+        case 'S': key = 4; break;  /* down */
+        case 'D': key = 2; break;  /* right */
     }
+}
 
-    if (key != 0) {
-        snake_logic();
-        snake_need_redraw = 1;
-        key = 0;
-    }
+static void snake_auto_tick(void)
+{
+    if (gameover) return;
+    if (key == 0) key = 2;   /* default right on first tick */
+
+    snake_logic();           /* move, eat, grow, collision */
+    snake_need_redraw = 1;
 }
 
 // This busywait loop is roughly accurate when running at 24 MHz.
@@ -781,6 +794,23 @@ void timer0_isr(void)
 
 	if (!(timer_cycles % LED_PWM_TIMER_CYCLES_PER_MILLISECOND)) {
 		++cycle_millis;
+
+		// Snake game tick + LED feedback (re-uses your 1 ms cycle)
+		snake_ms_counter++;
+		if (snake_ms_counter >= SNAKE_TICK_MS) {
+			snake_do_tick = true;
+			snake_ms_counter = 0;
+		}
+
+		if (snake_flash_green) {
+			set_led_timer_ccvb(GREEN_LED, 100);  /* full green flash */
+			snake_flash_green = false;
+		}
+		if (snake_flash_red) {
+			set_led_timer_ccvb(RED_LED, 100);    /* red pulse on death */
+			snake_flash_red = false;
+		}
+
 		timer_cycles = 0;
 	}
 
@@ -1508,6 +1538,11 @@ int main(void)
             if (pending_snake_key) {
                 snake_handle_key(pending_snake_key);
                 pending_snake_key = 0;
+            }
+
+            if (snake_do_tick) {
+                snake_auto_tick();
+                snake_do_tick = false;
             }
 
             if (snake_need_redraw) {
