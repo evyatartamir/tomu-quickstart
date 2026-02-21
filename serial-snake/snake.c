@@ -920,16 +920,9 @@ int main(void)
                 usb_puts_full("\x1B[2J\x1B[H");
                 usb_puts_full("\r\n=== GAME OVER! ===\r\nFinal Score: ");
 
-                char num[12];
-                char *np = num + sizeof(num) - 1;
-                *np = '\0';
-                int tmp = score;
-                if (tmp == 0) *--np = '0';
-                else while (tmp > 0) {
-                    *--np = '0' + (tmp % 10);
-                    tmp /= 10;
-                }
-                usb_puts_full(np);
+                char num_string_buf[12];
+				itoa(score, num_string_buf, 10);                
+                usb_puts_full(num_string_buf);
 
                 usb_puts_full("\r\nPress any key to restart or X to quit\r\n");
                 game_over_displayed = 1;
