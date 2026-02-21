@@ -64,6 +64,7 @@ TOBOOT_CONFIGURATION(0);
 #define SNAKE_BOARD_HEIGHT 20
 #define SNAKE_BOARD_WIDTH  40
 #define SNAKE_SCORE_INCREMENT 10
+#define SNAKE_MAX_TAIL_LENGTH 100
 
 #define GREEN_LED_FLASH_MS 150
 
@@ -229,10 +230,10 @@ void udelay_busy(uint32_t usecs);
 static void usb_puts(char *s);
 static void usb_puts_full(const char *s);
 
-int snakeTailX[100], snakeTailY[100];
-int snakeTailLen;
+int snake_tail_x[SNAKE_MAX_TAIL_LENGTH], snake_tail_y[SNAKE_MAX_TAIL_LENGTH];
+int snake_tail_len;
 int gameover, key, score;
-int x, y, fruitx, fruity;
+int snake_head_x, snake_head_y, fruit_x, fruit_y;
 int in_snake_mode = 0;
 int game_over_displayed = 0;
 
@@ -260,27 +261,27 @@ static void snake_setup(void)
     gameover = 0;
     key = 0;
     score = 0;
-    snakeTailLen = 3;
+    snake_tail_len = 3;
     paused = 0;
 
-    x = SNAKE_BOARD_WIDTH / 2;
-    y = SNAKE_BOARD_HEIGHT / 2;
+    snake_head_x = SNAKE_BOARD_WIDTH / 2;
+    snake_head_y = SNAKE_BOARD_HEIGHT / 2;
 
-    prng_seed ^= (uint32_t)&x;
+    prng_seed ^= (uint32_t)&snake_head_x;
     prng_seed = prng_seed * 1103515245UL + 12345;
 
-    fruitx = 10 + simple_rand(SNAKE_BOARD_WIDTH - 20);
-    fruity = 5  + simple_rand(SNAKE_BOARD_HEIGHT - 10);
+    fruit_x = 10 + simple_rand(SNAKE_BOARD_WIDTH - 20);
+    fruit_y = 5  + simple_rand(SNAKE_BOARD_HEIGHT - 10);
 
-    for (int i = 0; i < snakeTailLen; i++) {
-        snakeTailX[i] = x - i;
-        snakeTailY[i] = y;
+    for (int i = 0; i < snake_tail_len; i++) {
+        snake_tail_x[i] = snake_head_x - i;
+        snake_tail_y[i] = snake_head_y;
     }
 
 	/* prevent any future garbage draw */
-    for (int i = snakeTailLen; i < 100; i++) {
-        snakeTailX[i] = -1;
-        snakeTailY[i] = -1;
+    for (int i = snake_tail_len; i < SNAKE_MAX_TAIL_LENGTH; i++) {
+        snake_tail_x[i] = -1;
+        snake_tail_y[i] = -1;
     }
 
     /* LEDs off at start of game */
@@ -293,19 +294,19 @@ static void snake_logic(void)
 {
     if (key == 0) return;
 
-    int prevX = x;
-    int prevY = y;
+    int prev_x = snake_head_x;
+    int prev_y = snake_head_y;
 
     /* move head */
     switch (key) {
-        case 1: x--; break;  /* A */
-        case 2: x++; break;  /* D */
-        case 3: y--; break;  /* W */
-        case 4: y++; break;  /* S */
+        case 1: snake_head_x--; break;  /* A */
+        case 2: snake_head_x++; break;  /* D */
+        case 3: snake_head_y--; break;  /* W */
+        case 4: snake_head_y++; break;  /* S */
     }
 
     /* wall */
-    if (x < 0 || x >= SNAKE_BOARD_WIDTH || y < 0 || y >= SNAKE_BOARD_HEIGHT) {
+    if (snake_head_x < 0 || snake_head_x >= SNAKE_BOARD_WIDTH || snake_head_y < 0 || snake_head_y >= SNAKE_BOARD_HEIGHT) {
         gameover = 1;
 		if (snake_led_feedback) {
 			gpio_clear(LED_RED_PORT, LED_RED_PIN);
@@ -314,30 +315,30 @@ static void snake_logic(void)
     }
 
     /* eat fruit FIRST — so the next link in the body has correct coordinates */
-    if (x == fruitx && y == fruity) {
+    if (snake_head_x == fruit_x && snake_head_y == fruit_y) {
         score += SNAKE_SCORE_INCREMENT;
-        snakeTailLen++;                     /* grow before shifting */
+        snake_tail_len++;                     /* grow before shifting */
 		
 		if (snake_led_feedback) {
 			green_flash_ms = GREEN_LED_FLASH_MS;
 			gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN);
 		}
         
-		fruitx = 5 + simple_rand(SNAKE_BOARD_WIDTH - 10);
-        fruity = 3 + simple_rand(SNAKE_BOARD_HEIGHT - 6);
+		fruit_x = 5 + simple_rand(SNAKE_BOARD_WIDTH - 10);
+        fruit_y = 3 + simple_rand(SNAKE_BOARD_HEIGHT - 6);
     }
 
     /* now shift body (new length already includes the growth) */
-    for (int i = snakeTailLen - 1; i > 0; i--) {
-        snakeTailX[i] = snakeTailX[i-1];
-        snakeTailY[i] = snakeTailY[i-1];
+    for (int i = snake_tail_len - 1; i > 0; i--) {
+        snake_tail_x[i] = snake_tail_x[i-1];
+        snake_tail_y[i] = snake_tail_y[i-1];
     }
-    snakeTailX[0] = prevX;   /* old head becomes new body segment */
-    snakeTailY[0] = prevY;
+    snake_tail_x[0] = prev_x;   /* old head becomes new body segment */
+    snake_tail_y[0] = prev_y;
 
     /* self collision */
-    for (int i = 0; i < snakeTailLen; i++) {
-        if (snakeTailX[i] == x && snakeTailY[i] == y) {
+    for (int i = 0; i < snake_tail_len; i++) {
+        if (snake_tail_x[i] == snake_head_x && snake_tail_y[i] == snake_head_y) {
             gameover = 1;
 			if (snake_led_feedback) {
             	gpio_clear(LED_RED_PORT, LED_RED_PIN);
@@ -361,14 +362,14 @@ static void snake_draw(void)
     for (int i = 0; i < SNAKE_BOARD_HEIGHT; i++) {
         *p++ = '|';
         for (int j = 0; j < SNAKE_BOARD_WIDTH; j++) {
-            if (i == y && j == x)
+            if (i == snake_head_y && j == snake_head_x)
                 *p++ = '@';
-            else if (i == fruity && j == fruitx)
+            else if (i == fruit_y && j == fruit_x)
                 *p++ = '*';
             else {
                 int is_body = 0;
-                for (int k = 0; k < snakeTailLen; k++) {
-                    if (snakeTailX[k] == j && snakeTailY[k] == i) {
+                for (int k = 0; k < snake_tail_len; k++) {
+                    if (snake_tail_x[k] == j && snake_tail_y[k] == i) {
                         *p++ = 'o';
                         is_body = 1;
                         break;
@@ -399,15 +400,14 @@ static void snake_draw(void)
 
 	while (*footer) *p++ = *footer++;
 						
-    // Print speed level */
-	const char *hz_text = "Speed level: ";
-    while (*hz_text) *p++ = *hz_text++;
+    // Print speed level
+	const char *level_text = "Speed level: ";
+    while (*level_text) *p++ = *level_text++;
 
 	uint32_t speed_level = ((SNAKE_TICK_MS_MAX - snake_tick_ms) / SNAKE_TICK_MS_INCREMENT) + 1;
     itoa(speed_level, num_string_buf, 10);
 	np = num_string_buf;
     while (*np) *p++ = *np++;
-
 
     *p = '\0';
 

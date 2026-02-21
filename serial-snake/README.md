@@ -38,31 +38,31 @@ CMD> s
 === SNAKE STARTED ===
 +----------------------------------------+
 |                                        |
-|                   o                    |
-|                   o                    |
-|                   o                    |
-|                   o                    |
-|                   o                    |
-|                   o                    |
-|                   o                    |
-|                 ooo                    |
-|                                        |
-|                      *                 |
 |                                        |
 |                                        |
 |                                        |
 |                                        |
 |                                        |
+|                  oooooooo@             |
+|                  o                     |
+|                  o                     |
+|                  o                     |
+|                  o                     |
+|                  o                     |
+|                  o                     |
+|                  o                     |
+|      *           o                     |
+|           oooooooo                     |
 |                                        |
 |                                        |
 |                                        |
 |                                        |
 +----------------------------------------+
-Score: 70    [ / ] speed  SPACE pause  X quit
-Speed level: 17
+Score: 210    [ / ] speed  SPACE pause  X quit
+Speed level: 18
 
 === GAME OVER! ===
-Final Score: 70
+Final Score: 210
 Press any key to restart or X to quit
 ```
 
