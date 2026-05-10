@@ -45,6 +45,8 @@ TOBOOT_CONFIGURATION(0);
 #define PRODUCT_ID                0x70b1    /* Assigned to Tomu project */
 #define DEVICE_VER                0x0BEB    /* Program version */
 
+#define EP_WRITE_RETRY_DELAY_USECS 50
+
 #define NUM_USB_STRINGS 7
 // CDC NCM definitions, which should probably be added to libopencm3 "usb/cdc.h".
 #define USB_CDC_DESCRIPTOR_SUBTYPE_ETHERNET 0x0F
@@ -72,9 +74,9 @@ TOBOOT_CONFIGURATION(0);
 #define USB_CDC_REQ_GET_CRC_MODE 0x89
 #define USB_CDC_REQ_SET_CRC_MODE 0x8A
 
-#define USB_CDC_ECM_NOTIFICATION_NETWORK_CONNECTION 0x0;
-#define USB_CDC_ECM_NOTIFICATION_RESPONSE_AVAILABLE 0x1;
-#define USB_CDC_ECM_NOTIFICATION_CONNECTION_SPEED_CHANGE 0x2A;
+#define USB_CDC_ECM_NOTIFICATION_NETWORK_CONNECTION 0x0
+#define USB_CDC_ECM_NOTIFICATION_RESPONSE_AVAILABLE 0x1
+#define USB_CDC_ECM_NOTIFICATION_CONNECTION_SPEED_CHANGE 0x2A
 
 // EFM32HG supports 3 IN and 3 OUT Endpoints.
 #define CDC_NCM_DATA_OUT_EP 0x01
@@ -87,9 +89,9 @@ TOBOOT_CONFIGURATION(0);
 struct usb_cdc_notification_header {
 	uint8_t bmRequestType;
 	uint8_t bNotificationCode;
-	uint8_t wValue;
-	uint8_t wIndex;
-	uint8_t wLength;
+	uint16_t wValue;
+	uint16_t wIndex;
+	uint16_t wLength;
 } __attribute__((packed));
 
 struct usb_cdc_notification_speed_change {
@@ -98,7 +100,7 @@ struct usb_cdc_notification_speed_change {
 	uint32_t ulbitrate;
 } __attribute__((packed));
 
-// CDC NCM11 5.4 Ethernet Networking Functional Descriptor
+// CDC NCM 1.1 5.4 Ethernet Networking Functional Descriptor
 struct usb_cdc_ethernet_descriptor {
 	uint8_t bFunctionLength;
 	uint8_t bDescriptorType;
@@ -110,7 +112,7 @@ struct usb_cdc_ethernet_descriptor {
 	uint8_t bNumberPowerFilters;
 } __attribute__((packed));
 
-// CDC NCM11 6.2.1 NCM Functional Descriptor
+// CDC NCM 1.1 6.2.1 NCM Functional Descriptor
 struct usb_cdc_ncm_descriptor {
 	uint8_t bFunctionLength;
 	uint8_t bDescriptorType;
@@ -121,11 +123,15 @@ struct usb_cdc_ncm_descriptor {
 
 #define USB_PUTS_DELAY_USEC 2000
 
-static volatile bool g_usbd_is_connected = false;
 static usbd_device *g_usbd_dev = 0;
 
-static volatile uint16_t g_frame_len = 0;
-static uint8_t g_ethernet_frame[1514];
+//TODO: Currently not used
+// static volatile uint16_t g_frame_len = 0;
+// static uint8_t g_ethernet_frame[1514];
+/* RX buffer for full NTB (one transfer) - matches our advertised dwNtbOutMaxSize */
+// TODO: Rename to g_ ?
+static uint8_t ntb_rx_buf[2048]; // TODO: Can it be reduced to 1542? Consider alignment.
+static volatile uint16_t ntb_rx_len = 0; // TODO: should this be volatile?
 
 static const struct usb_device_descriptor dev = {
 	.bLength = USB_DT_DEVICE_SIZE,
@@ -295,9 +301,7 @@ static const char* usb_strings[NUM_USB_STRINGS] = {
 	"CDC-NCM Data" // CDC NCM data (second alternate) interface name
 };
 
-// TODO: Fix clobbering as done in my other programs
-
-/* This busywait loop is roughly accurate when running at 24 MHz. */
+// This busywait loop is roughly accurate when running at 24 MHz.
 void udelay_busy(uint32_t usecs)
 {
 	while (usecs --> 0) {
@@ -306,56 +310,59 @@ void udelay_busy(uint32_t usecs)
 		 * We want to sleep for 1 usec, and there are cycles per usec at 24 MHz.
 		 * Therefore, loop 6 times, as 6*4=24.
 		 */
-		asm("mov   r1, #6");
-		asm("retry:");
-		asm("sub r1, #1");
-		asm("bne retry");
-		asm("nop");
+		asm volatile(
+			"mov   r1, #6\n"
+			"retry:\n"
+			"sub   r1, #1\n"
+			"bne   retry\n"
+			"nop"
+			: : : "r1"
+		);
 	}
 }
 
 /* Buffer to be used for control requests. */
 static uint8_t usbd_control_buffer[128];
 
+// Minimal NTB parameters we advertise (NCM 1.0, NTB-16 only, single frame, 2 KiB buffers)
+// CDC NCM 1.1 7.2.1 GetNtbParameters Data - NTB Parameter Structure (Table 7-3)
+// Fields are stored as Little Endian
+static const uint8_t ntb_parameters[0x1C] = {
+	0x1C, 0x00,                     /* wLength */
+	0x01, 0x00,                     /* bmNtbFormatsSupported = NTB-16 only */
+	0x00, 0x08, 0x00, 0x00,         /* dwNtbInMaxSize  = 2048 bytes */
+	0x04, 0x00,                     /* wNdpInDivisor */
+	0x00, 0x00,                     /* wNdpInPayloadRemainder */
+	0x04, 0x00,                     /* wNdpInAlignment */
+	0x00, 0x00,                     /* Reserved, padding. */
+	0x00, 0x08, 0x00, 0x00,         /* dwNtbOutMaxSize = 2048 bytes */
+	0x04, 0x00,                     /* wNdpOutDivisor */
+	0x00, 0x00,                     /* wNdpOutPayloadRemainder */
+	0x04, 0x00,                     /* wNdpOutAlignment */
+	0x01, 0x00                      /* wNtbOutMaxDatagrams = 1 (only one frame per OUT NTB) */
+};
+
+// Current NTB input size the host told us (we'll store it)
+static uint32_t g_ntb_in_max_size = 2048;
+
+// Current MAC Address in network byte order
+static uint8_t g_mac_address[6] = {0x4C, 0xFC, 0xAA, 0x12, 0x3B, 0xEB};
+
 static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev, struct usb_setup_data *req, uint8_t **buf,
 		uint16_t *len, void (**complete)(usbd_device *usbd_dev, struct usb_setup_data *req))
 {
 	(void)complete;
-	(void)buf;
 	(void)usbd_dev;
 
 	switch(req->bRequest) {
-		
-		//TODO: Probably not relevant for NCM, only ACM which we don't include.
-		case USB_CDC_REQ_SET_CONTROL_LINE_STATE: {
-			g_usbd_is_connected = req->wValue & 1; // Check RTS bit
-			
-			if (!g_usbd_is_connected) { // Note: GPIO polarity is inverted
-				gpio_set(LED_GREEN_PORT, LED_GREEN_PIN);
-			} else {
-				gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN);
-			}
+		// NCM control requests (CDC NCM 1.1 document, section 7.2)
 
-			return USBD_REQ_HANDLED;
-			}
-		break;
-		case USB_CDC_REQ_SET_LINE_CODING: 
-			if (*len < sizeof(struct usb_cdc_line_coding))
-				return USBD_REQ_NOTSUPP;
-			return USBD_REQ_HANDLED;        
-		break;
-
-		// NCM control requests (NCM11 document, section 7.2)
-
-		// Optional NCM requests we do not support: (TODO: Support some of them)
+		// Optional NCM requests we do not support:
 		case USB_CDC_REQ_SET_ETHERNET_MULTICAST_FILTERS:
 		case USB_CDC_REQ_SET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER:
 		case USB_CDC_REQ_GET_ETHERNET_POWER_MANAGEMENT_PATTERN_FILTER:
 		case USB_CDC_REQ_SET_ETHERNET_PACKET_FILTER:
 		case USB_CDC_REQ_GET_ETHERNET_STATISTIC:
-		// TODO: Support NET ADDRESS, since I set D1 in bmNetworkCapabilities
-		case USB_CDC_REQ_GET_NET_ADDRESS:
-		case USB_CDC_REQ_SET_NET_ADDRESS:
 		case USB_CDC_REQ_GET_NTB_FORMAT:
 		case USB_CDC_REQ_SET_NTB_FORMAT:
 		case USB_CDC_REQ_GET_MAX_DATAGRAM_SIZE:
@@ -364,55 +371,70 @@ static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev,
 		case USB_CDC_REQ_SET_CRC_MODE:
 			return USBD_REQ_NOTSUPP;
 		break;
-		
+	
+		// How replies work in libopencm3:
+		// *buf: Point this to the memory buffer containing the data you want to send.
+		// *len: Set this to the number of bytes to be sent.
+		// Make sure buf is still allocated when the function returns, e.g. static global buffer.
+		// Set the "complete" callback if actions are needed after the Control request is complete, acknowledged by the Host.
+
+		//TODO: Add complete function to toggle GPIO? Or not needed since it works?
+		/*
+		static void my_done_callback(usbd_device *usbd_dev, struct usb_setup_data *req) {
+		// This runs AFTER the data is sent and acknowledged
+		gpio_toggle(GPIOA, GPIO5); 
+		}
+
+		static int my_control_callback(usbd_device *usbd_dev, struct usb_setup_data *req, 
+								uint8_t **buf, uint16_t *len, 
+								void (**complete)(usbd_device *, struct usb_setup_data *)) 
+		{
+			if (req->bRequest == MY_GET_DATA_REQ) {
+				*buf = my_data_buffer;  // Point to the data to return
+				*len = sizeof(my_data_buffer);
+				*complete = my_done_callback; // Register the post-transfer action
+				return 1; // Request Handled
+			}
+		return 0; // Request Not Handled
+		}
+		*/
+
 		// Required NCM requests we must support:
 		case USB_CDC_REQ_GET_NTB_PARAMETERS:
-			//TODO: Implement logic, and return reply on the control endpoint:
-			// *buf: Point this to the memory buffer containing the data you want to send.
-			// *len: Set this to the number of bytes to be sent.
-			// Make sure buf is still allocated when the function returns:
-			// Use global buffer (static uint8_t) with the largest reply expected (0x1C for NTB params)
-			// Or to a const array, e.g.: *buf = (uint8_t *)"MyDevice123";
-			// Or  static const uint8_t my_numerical_data[] = { 0xDE, 0xAD, 0xBE, 0xEF };
-			//    *buf = (uint8_t *)my_numerical_data;
-			// If the data is not static (even if it's const), some compilers might still put it on the stack as a temporary local variable. 
-			// Always use static inside the function, or define the array outside the function at the top of your file.
-			// Set the "complete" callback if actions are needed after the Control request is complete, acknowledged by the Host.
-			// e.g. freeing memory, applying settings, triggering actions.
-
-			/*
-			static void my_done_callback(usbd_device *usbd_dev, struct usb_setup_data *req) {
-			// This runs AFTER the data is sent and acknowledged
-			gpio_toggle(GPIOA, GPIO5); 
-			}
-
-			static int my_control_callback(usbd_device *usbd_dev, struct usb_setup_data *req, 
-									uint8_t **buf, uint16_t *len, 
-									void (**complete)(usbd_device *, struct usb_setup_data *)) 
-			{
-				if (req->bRequest == MY_GET_DATA_REQ) {
-					*buf = my_data_buffer;  // Point to the data to return
-					*len = sizeof(my_data_buffer);
-					*complete = my_done_callback; // Register the post-transfer action
-					return 1; // Request Handled
-				}
-			return 0; // Request Not Handled
-			}
-			*/
-			
-
+			*buf = (uint8_t *) ntb_parameters;
+			*len = sizeof(ntb_parameters);
 			return USBD_REQ_HANDLED;
 		break;
 
 		case USB_CDC_REQ_GET_NTB_INPUT_SIZE:
-			//TODO: Implement logic, and return reply.
+			*buf = (uint8_t *)&g_ntb_in_max_size;     /* little-endian 32-bit */
+			*len = 4;
 			return USBD_REQ_HANDLED;
 		break;
 
 		case USB_CDC_REQ_SET_NTB_INPUT_SIZE:
-			//TODO: Implement logic
+			if (*len == 4) {
+				g_ntb_in_max_size = *(uint32_t *)(*buf);  // dwNtbInMaxSize from Host
+				return USBD_REQ_HANDLED;
+			} else {
+				return USBD_REQ_NOTSUPP;
+			}
+		break;
+
+		// Support NET ADDRESS, since we set bit D1 in bmNetworkCapabilities.
+		case USB_CDC_REQ_GET_NET_ADDRESS:
+			*buf = (uint8_t *) &g_mac_address;
+			*len = sizeof(g_mac_address);
 			return USBD_REQ_HANDLED;
 		break;
+		case USB_CDC_REQ_SET_NET_ADDRESS:
+			if (*len == sizeof(g_mac_address)) {
+				memcpy(g_mac_address, (uint8_t *)(*buf), sizeof(g_mac_address));
+				return USBD_REQ_HANDLED;
+			} else {
+				return USBD_REQ_NOTSUPP;
+			}
+		break;		
 	}
 	
 	return USBD_REQ_NOTSUPP;
@@ -420,13 +442,13 @@ static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev,
 
 //TODO: Add delay in case the endpoint is busy, as done in my other programs.
 // TODO: Remove this function or convert to hard-coded UDP send
-static void usb_puts(char *s) {
-	if (g_usbd_is_connected) {
+static void usb_puts(char *s) {	
 		gpio_toggle(LED_GREEN_PORT, LED_GREEN_PIN); // TODO: Toggle green LED
 		// usbd_ep_write_packet(g_usbd_dev, CDC_ACM_DATA_IN_EP, s, strnlen(s, 64));
-	}
 }
 
+//TODO: Might use these later
+/*
 static char nibble_to_hexchar(uint8_t nibble) {
 	if (nibble < 10) {
 		return (char) (nibble + '0');
@@ -443,7 +465,96 @@ static void buf_to_hexstring(uint8_t* source, char* dest, unsigned int start_ind
 		dest[(current_byte_index - start_index)*2 + 1] = nibble_to_hexchar(source[current_byte_index] & 0xF); // LSB nibble
 	}
 }
+*/
 
+/* Minimal NTB-16 TX helper - builds a one-frame NTB and sends it */
+static void ncm_send_frame(const uint8_t *frame, uint16_t frame_len)
+{
+    if (frame_len == 0 || frame_len > 1514) return;
+
+    // Simple one-frame NTB-16
+    // TODO: 2048 bytes matches our advertised dwNtbOutMaxSize, although we only used headers (12+16) + Ethernet frame (1514)
+	// TODO: Perhaps this can be reduced to 1542? Consider alignment.
+	static uint8_t ntb_buf[2048];  
+	uint16_t ntb_len = 0;
+
+    /* NTH16 - "NCMH" */
+    ntb_buf[ntb_len++] = 'N'; ntb_buf[ntb_len++] = 'C'; ntb_buf[ntb_len++] = 'M'; ntb_buf[ntb_len++] = 'H';
+    ntb_buf[ntb_len++] = 0x0C; ntb_buf[ntb_len++] = 0x00;  /* wHeaderLength */
+    ntb_buf[ntb_len++] = 0x00; ntb_buf[ntb_len++] = 0x00;  /* wSequence (we ignore) */ //TODO: Can we ignore?
+    ntb_buf[ntb_len++] = 0x00; ntb_buf[ntb_len++] = 0x00;  /* wBlockLength will be filled later */
+    ntb_buf[ntb_len++] = 0x0C; ntb_buf[ntb_len++] = 0x00;  /* wNdpIndex = 12 (right after NTH) */
+
+    /* NDP16 - "NCM0" */
+    ntb_buf[ntb_len++] = 'N'; ntb_buf[ntb_len++] = 'C'; ntb_buf[ntb_len++] = 'M'; ntb_buf[ntb_len++] = '0';
+    ntb_buf[ntb_len++] = 0x10; ntb_buf[ntb_len++] = 0x00;  /* wLength = 16 (one entry + zero) */
+    ntb_buf[ntb_len++] = 0x00; ntb_buf[ntb_len++] = 0x00;  /* wNextNdpIndex = 0 */
+    /* First datagram entry */
+    ntb_buf[ntb_len++] = 0x1C; ntb_buf[ntb_len++] = 0x00;  /* wDatagramIndex = 12+16 (after NTB+NDP) */
+    ntb_buf[ntb_len++] = frame_len & 0xFF;
+    ntb_buf[ntb_len++] = (frame_len >> 8) & 0xFF;          /* wDatagramLength */
+    /* Zero terminator */
+    ntb_buf[ntb_len++] = 0x00; ntb_buf[ntb_len++] = 0x00;
+    ntb_buf[ntb_len++] = 0x00; ntb_buf[ntb_len++] = 0x00;
+
+    /* Copy the actual Ethernet frame */
+    memcpy(ntb_buf + ntb_len, frame, frame_len);
+    ntb_len += frame_len;
+
+    /* Fix wBlockLength in NTH */
+    ntb_buf[8] = ntb_len & 0xFF;
+    ntb_buf[9] = (ntb_len >> 8) & 0xFF;
+
+    /* Send it (may take several bulk packets) */
+    usbd_ep_write_packet(g_usbd_dev, CDC_NCM_DATA_IN_EP, ntb_buf, ntb_len);
+    gpio_toggle(LED_GREEN_PORT, LED_GREEN_PIN);  /* visual TX feedback */
+}
+
+/* Minimal NTB-16 parser - called only when a complete NTB has been received */
+static void ncm_parse_and_echo_ntb(void)
+{
+    if (ntb_rx_len < 12) return;
+
+    /* Check NTH16 signature "NCMH" */
+    if (ntb_rx_buf[0] != 'N' || ntb_rx_buf[1] != 'C' || ntb_rx_buf[2] != 'M' || ntb_rx_buf[3] != 'H') {
+        // usb_puts("\r\nBad NTH signature\r\n");
+        goto reset;
+    }
+
+    /* Get NDP index from NTH (offset 10) */
+    uint16_t ndp_idx = ntb_rx_buf[10] | (ntb_rx_buf[11] << 8);
+    if (ndp_idx + 12 > ntb_rx_len) {
+		goto reset;
+	}
+
+    /* Check NDP16 signature "NCM0" */
+    if (ntb_rx_buf[ndp_idx] != 'N' || ntb_rx_buf[ndp_idx+1] != 'C' ||
+        ntb_rx_buf[ndp_idx+2] != 'M' || ntb_rx_buf[ndp_idx+3] != '0') {
+        // usb_puts("\r\nBad NDP signature\r\n");
+        goto reset;
+    }
+
+    /* First datagram pointer (offset 8 inside NDP) */
+    uint16_t frame_offset = ntb_rx_buf[ndp_idx+8] | (ntb_rx_buf[ndp_idx+9] << 8);
+    uint16_t frame_len    = ntb_rx_buf[ndp_idx+10] | (ntb_rx_buf[ndp_idx+11] << 8);
+
+    if (frame_offset == 0 || frame_len == 0 || frame_offset + frame_len > ntb_rx_len) {
+        // usb_puts("\r\nBad frame pointer\r\n");
+        goto reset;
+    }
+
+    /* We have a valid Ethernet frame! */
+    // usb_puts("\r\nRX frame len: ");
+    // char tmp[6]; itoa(frame_len, tmp, 10); usb_puts(tmp); usb_puts("\r\n");
+
+    /* Echo it back as a proper NTB */
+    ncm_send_frame(ntb_rx_buf + frame_offset, frame_len);
+
+reset:
+    ntb_rx_len = 0;   /* ready for next NTB */
+}
+
+/*
 static void handle_ethernet_frame() {
 
 //TODO: This function might be too long for the USB interrupt, with all the delays
@@ -482,53 +593,39 @@ static void handle_ethernet_frame() {
 
 	g_frame_len = 0;
 }
+*/
 
 static void cdcncm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 {
 	(void)ep;
-	(void)usbd_dev;
+    (void)usbd_dev;
 
-	gpio_toggle(LED_RED_PORT, LED_RED_PIN); // TODO: Light the Red LED for debug
+    gpio_toggle(LED_RED_PORT, LED_RED_PIN);   /* RX activity */
 
-	//TODO: NTB logic
+    uint8_t packet_buf[64];
+    uint16_t len = usbd_ep_read_packet(usbd_dev, CDC_NCM_DATA_OUT_EP, packet_buf, sizeof(packet_buf));
 
-	uint8_t packet_buf[64];
-	uint16_t len = usbd_ep_read_packet(usbd_dev, CDC_NCM_DATA_OUT_EP, packet_buf, sizeof(packet_buf));
+    if (len == 0) {                     /* Zero-length packet = end of NTB */
+        if (ntb_rx_len > 0) {
+            ncm_parse_and_echo_ntb();
+        }
+        return;
+    }
 
+    /* Append this packet to the current NTB */
+    if (ntb_rx_len + len > sizeof(ntb_rx_buf)) {
+        // usb_puts("\r\nNTB overflow\r\n");
+        ntb_rx_len = 0;
+        return;
+    }
 
-	char packet_len_buf[3];
+    memcpy(ntb_rx_buf + ntb_rx_len, packet_buf, len);
+    ntb_rx_len += len;
 
-	usb_puts("\r\nLen: ");
-	udelay_busy(USB_PUTS_DELAY_USEC);
-	itoa(len, packet_len_buf, 10);
-	usb_puts(packet_len_buf);
-	udelay_busy(USB_PUTS_DELAY_USEC);
-
-	// See USB CDC ECM document, section 3.3.1 Segment Delineation.
-	// Basically, the last packet will be < 64. If the frame is a multiple of 64, there will be a zero-length packet.
-
-	if (len == 0) { // Zero-length packet
-		if (g_frame_len) { // Frame has data
-			handle_ethernet_frame();			
-		} else {
-			usb_puts("\r\nUnexpected 0-len packet");
-			udelay_busy(USB_PUTS_DELAY_USEC);
-		}
-		return;
-	}
-
-	if ((g_frame_len + len) > (sizeof(g_ethernet_frame))) {
-		g_frame_len = 0; // Drop frame data
-		usb_puts("\r\nError: Frame overflow");
-		udelay_busy(USB_PUTS_DELAY_USEC);	
-	}
-	
-	memcpy(g_ethernet_frame + g_frame_len, packet_buf, len);
-	g_frame_len+=len;
-	if (len < 64) { // Last packet in a frame
-		handle_ethernet_frame();
-		return;
-	}
+    /* If this was a short packet (< 64 bytes), the NTB is complete */
+    if (len < 64) {
+        ncm_parse_and_echo_ntb();
+    }
 
 	return;
 }
@@ -547,34 +644,51 @@ static void cdc_altsetting_cc(usbd_device *usbd_dev, uint16_t wIndex, uint16_t w
 
 	// Set alternate NCM data interface
 	
-	// NCM11 9.1 Notification Sequencing
+	// NCM 1.1 9.1 Notification Sequencing
 	// NCM functions are required to send ConnectionSpeedChange and NetworkConnection notifications in a specific order. 
 
 	// Send a notification for ConnectionSpeedChange + NetworkConnection
+	uint16_t return_value;
 
 	// ConnectionSpeedChange - USB CDC document 6.3.3
-	struct usb_cdc_notification_speed_change notify_speed_change;
-	notify_speed_change.notify_header.bmRequestType = 0xA1; // Value 10100001B from CDC document.
-	notify_speed_change.notify_header.bNotificationCode = USB_CDC_ECM_NOTIFICATION_CONNECTION_SPEED_CHANGE;
-	notify_speed_change.notify_header.wIndex = wIndex;
-	notify_speed_change.notify_header.wValue = 0;
-	notify_speed_change.notify_header.wLength = 8;
-	notify_speed_change.dlbitrate = 10000000; // 10 Mbps
-	notify_speed_change.ulbitrate = 10000000; // 10 Mbps
-	usbd_ep_write_packet(g_usbd_dev, CDC_NCM_NOTIFY_EP, &notify_speed_change, sizeof(notify_speed_change));
+	struct usb_cdc_notification_speed_change speed = {
+		.notify_header = {
+			.bmRequestType = 0xA1, // Value 10100001B from CDC document.
+			.bNotificationCode = USB_CDC_ECM_NOTIFICATION_CONNECTION_SPEED_CHANGE,
+			.wValue = 0,
+			.wIndex = CDC_NCM_DATA_INTERFACE_NUM,
+			.wLength = 8,
+		},
+		.dlbitrate = 10000000, // 10 Mbps
+		.ulbitrate = 10000000, // 10 Mbps
+	};
 
-	udelay_busy(1000); // TODO: Needed? Modify to loop on the output port if it's busy?
+	return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_NOTIFY_EP, &speed, sizeof(speed));
+	// The endpoint might be busy transmitting, wait a little and retry.
+	while (!return_value) {
+		udelay_busy(EP_WRITE_RETRY_DELAY_USECS);
+		return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_NOTIFY_EP, &speed, sizeof(speed));
+	}
 
 	// NetworkConnection - USB CDC document 6.3.1
-	struct usb_cdc_notification_header notify_buf;
-	notify_buf.bmRequestType = 0xA1; // Value 10100001B from CDC document.
-	notify_buf.wIndex = wIndex;
-	notify_buf.bNotificationCode = USB_CDC_ECM_NOTIFICATION_NETWORK_CONNECTION;
-	notify_buf.wLength = 0;        
-	notify_buf.wValue = 1; // 1 = Connected, 0 = Disconnected.
-	usbd_ep_write_packet(g_usbd_dev, CDC_NCM_NOTIFY_EP, &notify_buf, sizeof(notify_buf));
+	struct usb_cdc_notification_header connection = {
+		.bmRequestType = 0xA1, // Value 10100001B from CDC document.
+		.bNotificationCode = USB_CDC_ECM_NOTIFICATION_NETWORK_CONNECTION,
+		.wValue = 1, // 1 = Connected, 0 = Disconnected.
+		.wIndex = CDC_NCM_DATA_INTERFACE_NUM,
+		.wLength = 0,
+	};
 
-	// TODO: Implement reset logic, as specified in NCM11:
+	return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_NOTIFY_EP, &connection, sizeof(connection));
+	// The endpoint might be busy transmitting, wait a little and retry.
+	while (!return_value) {
+		udelay_busy(EP_WRITE_RETRY_DELAY_USECS);
+		return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_NOTIFY_EP, &connection, sizeof(connection));
+	}
+
+	gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN);   // solid green = link up
+
+	// TODO: Implement reset logic, as specified in NCM 1.1:
 	// 9.2 Using Alternate Settings to Reset an NCM Function
 
 	return;
@@ -624,7 +738,7 @@ void sys_tick_handler(void)
 	static uint16_t tick_counter = 0;
 
 	if (tick_counter >= 5000) { // Every 5 seconds
-		usb_puts("\r\nSysTick\r\n");
+		// usb_puts("\r\nSysTick\r\n");
 		tick_counter = 0;
 	}
 	
@@ -633,8 +747,6 @@ void sys_tick_handler(void)
 
 int main(void)
 {
-	bool line_was_connected = false;
-
 	/* Disable the watchdog that the bootloader started. */
 	WDOG_CTRL = 0;
 
@@ -671,16 +783,6 @@ int main(void)
 
 
 	while(1) {
-		
-		// TODO: Modify, we don't support CDC ACM config.
-		if (line_was_connected != g_usbd_is_connected) {
-			if (g_usbd_is_connected) {
-				udelay_busy(USB_PUTS_DELAY_USEC);
-				// usb_puts("\r\nUSB CDC ACM Connected!\r\n");
-				udelay_busy(USB_PUTS_DELAY_USEC);
-			}
-			line_was_connected = g_usbd_is_connected;
-		}
-
+		;
 	}
 }
