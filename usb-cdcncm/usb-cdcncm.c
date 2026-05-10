@@ -125,12 +125,9 @@ struct usb_cdc_ncm_descriptor {
 
 static usbd_device *g_usbd_dev = 0;
 
-//TODO: Currently not used
-// static volatile uint16_t g_frame_len = 0;
-// static uint8_t g_ethernet_frame[1514];
 /* RX buffer for full NTB (one transfer) - matches our advertised dwNtbOutMaxSize */
 // TODO: Rename to g_ ?
-static uint8_t ntb_rx_buf[2048]; // TODO: Can it be reduced to 1542? Consider alignment.
+static uint8_t ntb_rx_buf[600]; // TODO: Can it be reduced to 1542 from 2048? Consider alignment.
 static volatile uint16_t ntb_rx_len = 0; // TODO: should this be volatile?
 
 static const struct usb_device_descriptor dev = {
@@ -345,8 +342,14 @@ static const uint8_t ntb_parameters[0x1C] = {
 // Current NTB input size the host told us (we'll store it)
 static uint32_t g_ntb_in_max_size = 2048;
 
-// Current MAC Address in network byte order
+// MAC Address in network byte order
 static uint8_t g_mac_address[6] = {0x4C, 0xFC, 0xAA, 0x12, 0x3B, 0xEB};
+static uint8_t g_server_mac_address[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+// Default IP addresses for host NIC and "remote server" we simulate.
+static uint8_t g_host_ip_address[4] = {192, 168, 7, 2};
+static uint8_t g_server_ip_address[4] = {192, 168, 7, 1};
+
+static uint32_t rx_count = 0, tx_count = 0;
 
 static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev, struct usb_setup_data *req, uint8_t **buf,
 		uint16_t *len, void (**complete)(usbd_device *usbd_dev, struct usb_setup_data *req))
@@ -376,28 +379,7 @@ static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev,
 		// *buf: Point this to the memory buffer containing the data you want to send.
 		// *len: Set this to the number of bytes to be sent.
 		// Make sure buf is still allocated when the function returns, e.g. static global buffer.
-		// Set the "complete" callback if actions are needed after the Control request is complete, acknowledged by the Host.
-
-		//TODO: Add complete function to toggle GPIO? Or not needed since it works?
-		/*
-		static void my_done_callback(usbd_device *usbd_dev, struct usb_setup_data *req) {
-		// This runs AFTER the data is sent and acknowledged
-		gpio_toggle(GPIOA, GPIO5); 
-		}
-
-		static int my_control_callback(usbd_device *usbd_dev, struct usb_setup_data *req, 
-								uint8_t **buf, uint16_t *len, 
-								void (**complete)(usbd_device *, struct usb_setup_data *)) 
-		{
-			if (req->bRequest == MY_GET_DATA_REQ) {
-				*buf = my_data_buffer;  // Point to the data to return
-				*len = sizeof(my_data_buffer);
-				*complete = my_done_callback; // Register the post-transfer action
-				return 1; // Request Handled
-			}
-		return 0; // Request Not Handled
-		}
-		*/
+		// Set the "*complete" callback if actions are needed after the Control request is complete, acknowledged by the Host.
 
 		// Required NCM requests we must support:
 		case USB_CDC_REQ_GET_NTB_PARAMETERS:
@@ -440,13 +422,6 @@ static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev,
 	return USBD_REQ_NOTSUPP;
 }
 
-//TODO: Add delay in case the endpoint is busy, as done in my other programs.
-// TODO: Remove this function or convert to hard-coded UDP send
-static void usb_puts(char *s) {	
-		gpio_toggle(LED_GREEN_PORT, LED_GREEN_PIN); // TODO: Toggle green LED
-		// usbd_ep_write_packet(g_usbd_dev, CDC_ACM_DATA_IN_EP, s, strnlen(s, 64));
-}
-
 //TODO: Might use these later
 /*
 static char nibble_to_hexchar(uint8_t nibble) {
@@ -474,8 +449,8 @@ static void ncm_send_frame(const uint8_t *frame, uint16_t frame_len)
 
     // Simple one-frame NTB-16
     // TODO: 2048 bytes matches our advertised dwNtbOutMaxSize, although we only used headers (12+16) + Ethernet frame (1514)
-	// TODO: Perhaps this can be reduced to 1542? Consider alignment.
-	static uint8_t ntb_buf[2048];  
+	// TODO: Perhaps this can be reduced to 1542 from 2048? Consider alignment.
+	static uint8_t ntb_buf[600];
 	uint16_t ntb_len = 0;
 
     /* NTH16 - "NCMH" */
@@ -505,9 +480,70 @@ static void ncm_send_frame(const uint8_t *frame, uint16_t frame_len)
     ntb_buf[8] = ntb_len & 0xFF;
     ntb_buf[9] = (ntb_len >> 8) & 0xFF;
 
-    /* Send it (may take several bulk packets) */
-    usbd_ep_write_packet(g_usbd_dev, CDC_NCM_DATA_IN_EP, ntb_buf, ntb_len);
+    // Send in 64-byte chunks (required on full-speed USB)
+	uint16_t sent = 0;
+	while (sent < ntb_len) {
+		uint16_t chunk = (ntb_len - sent) > 64 ? 64 : (ntb_len - sent);
+		uint16_t return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_DATA_IN_EP, ntb_buf + sent, chunk);
+		while (!return_value) {
+			udelay_busy(EP_WRITE_RETRY_DELAY_USECS);
+			return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_DATA_IN_EP, ntb_buf + sent, chunk);
+		}
+		sent += chunk;
+	}
+	
+	tx_count++;
     gpio_toggle(LED_GREEN_PORT, LED_GREEN_PIN);  /* visual TX feedback */
+}
+
+/* Hard-coded UDP debug packet to 192.168.7.2:1234 */
+static void send_udp_debug(void)
+{
+    uint8_t packet[128];
+    uint16_t len = 0;
+
+    /* 1. Ethernet header (14 bytes) */
+    memcpy(packet + len, g_mac_address, 6);          len += 6;   // dst = host
+    memcpy(packet + len, g_server_mac_address, 6);           len += 6;   // src = us
+    packet[len++] = 0x08; packet[len++] = 0x00;            // EtherType = IPv4
+
+    /* 2. IPv4 header (20 bytes) */
+    packet[len++] = 0x45; packet[len++] = 0x00;
+    packet[len++] = 0x00; packet[len++] = 0x00;   // total length (fix later)
+    packet[len++] = 0x00; packet[len++] = 0x01;	  // Identification
+    packet[len++] = 0x00; packet[len++] = 0x00;   // Flags + Fragment Offset
+    packet[len++] = 0x40; packet[len++] = 0x11;   // TTL, protocol = UDP
+    packet[len++] = 0x00; packet[len++] = 0x00;   // Header Checksum (0 for now)
+    memcpy(packet + len, g_server_ip_address, 4); len += 4;    // src IP
+    memcpy(packet + len, g_host_ip_address, 4); len += 4;    // dst IP
+
+	/* 3. UDP header (8 bytes) */
+	//TODO: Make destination port a constant define instead of hard-coded?
+    packet[len++] = 0x04; packet[len++] = 0xD2;                 // src port 1234
+    packet[len++] = 0x04; packet[len++] = 0xD2;                 // dst port 1234
+    packet[len++] = 0x00; packet[len++] = 0x00;                 // UDP Length (fix later)
+    packet[len++] = 0x00; packet[len++] = 0x00;                 // UDP Checksum (0 for now)
+
+	/* 4. Payload */
+    char status[16];
+    strcpy((char*)packet + len, "RX:"); len += 3;
+    itoa(rx_count, status, 10);
+    strcpy((char*)packet + len, status); len += strlen(status);
+    strcpy((char*)packet + len, " TX:"); len += 4;
+    itoa(tx_count, status, 10);
+    strcpy((char*)packet + len, status); len += strlen(status);
+    packet[len++] = '\r'; packet[len++] = '\n';
+
+	/* Fix lengths */
+    uint16_t ip_total = len - 14; // 14 bytes of Ethernet header
+    packet[16] = (ip_total >> 8) & 0xFF;
+    packet[17] = ip_total & 0xFF;
+
+    uint16_t udp_len = len - 34;   // 14 (Eth) + 20 (IP)
+    packet[38] = (udp_len >> 8) & 0xFF;
+    packet[39] = udp_len & 0xFF;
+
+    ncm_send_frame(packet, len);
 }
 
 /* Minimal NTB-16 parser - called only when a complete NTB has been received */
@@ -517,7 +553,6 @@ static void ncm_parse_and_echo_ntb(void)
 
     /* Check NTH16 signature "NCMH" */
     if (ntb_rx_buf[0] != 'N' || ntb_rx_buf[1] != 'C' || ntb_rx_buf[2] != 'M' || ntb_rx_buf[3] != 'H') {
-        // usb_puts("\r\nBad NTH signature\r\n");
         goto reset;
     }
 
@@ -530,7 +565,6 @@ static void ncm_parse_and_echo_ntb(void)
     /* Check NDP16 signature "NCM0" */
     if (ntb_rx_buf[ndp_idx] != 'N' || ntb_rx_buf[ndp_idx+1] != 'C' ||
         ntb_rx_buf[ndp_idx+2] != 'M' || ntb_rx_buf[ndp_idx+3] != '0') {
-        // usb_puts("\r\nBad NDP signature\r\n");
         goto reset;
     }
 
@@ -539,68 +573,49 @@ static void ncm_parse_and_echo_ntb(void)
     uint16_t frame_len    = ntb_rx_buf[ndp_idx+10] | (ntb_rx_buf[ndp_idx+11] << 8);
 
     if (frame_offset == 0 || frame_len == 0 || frame_offset + frame_len > ntb_rx_len) {
-        // usb_puts("\r\nBad frame pointer\r\n");
         goto reset;
     }
 
-    /* We have a valid Ethernet frame! */
-    // usb_puts("\r\nRX frame len: ");
-    // char tmp[6]; itoa(frame_len, tmp, 10); usb_puts(tmp); usb_puts("\r\n");
+    // Valid Ethernet frame
+	rx_count++;
+	gpio_toggle(LED_RED_PORT, LED_RED_PIN); // TODO: Debug
 
-    /* Echo it back as a proper NTB */
+	/* Check for ARP request for our IP */
+	uint8_t* packet = &ntb_rx_buf[frame_offset];
+    if (frame_len >= 42 && 
+        packet[12] == 0x08 && packet[13] == 0x06 &&           // EtherType ARP
+        packet[21] == 0x01 &&                                 // opcode = request
+        memcmp(packet + 38, g_server_ip_address, 4) == 0) {   // target IP = ours
+        
+        /* Build ARP reply */
+        uint8_t arp_reply[42];
+		memcpy(arp_reply, g_mac_address, 6);                // dst = host
+        memcpy(arp_reply + 6, g_server_mac_address, 6);     // src = us		
+        arp_reply[12] = 0x08; arp_reply[13] = 0x06;         // EtherType ARP
+        arp_reply[14] = 0x00; arp_reply[15] = 0x01;         // HW type Ethernet
+        arp_reply[16] = 0x08; arp_reply[17] = 0x00;         // protocol IP
+        arp_reply[18] = 6; arp_reply[19] = 4;               // HW / proto length
+        arp_reply[20] = 0x00; arp_reply[21] = 0x02;         // opcode = reply
+        memcpy(arp_reply + 22, g_server_mac_address, 6);    // sender MAC
+        memcpy(arp_reply + 28, g_server_ip_address, 4);     // sender IP
+        memcpy(arp_reply + 32, packet + 22, 6);           	// target MAC (request sender MAC)
+        memcpy(arp_reply + 38, packet + 28, 4);             // target IP (request sender IP)
+
+        ncm_send_frame(arp_reply, 42);
+        goto reset;
+    }
+
+	/* Echo the frame back as a proper NTB */
     ncm_send_frame(ntb_rx_buf + frame_offset, frame_len);
 
 reset:
     ntb_rx_len = 0;   /* ready for next NTB */
 }
 
-/*
-static void handle_ethernet_frame() {
-
-//TODO: This function might be too long for the USB interrupt, with all the delays
-//TODO: I might need to add locking, or double-buffer the Ethernet frame buf
-
-	char len_string[5];
-	itoa(g_frame_len, len_string, 10);
-
-	usb_puts("\r\nFrame len: ");
-	udelay_busy(USB_PUTS_DELAY_USEC);
-	
-	usb_puts(len_string);
-	udelay_busy(USB_PUTS_DELAY_USEC);
-
-
-	usb_puts("\r\nData: ");
-	udelay_busy(USB_PUTS_DELAY_USEC);
-
-	// For each byte, we write 2 Hex chars.
-	// We can only print 64 chars at a time, so we read 32 bytes.
-
-	char char_buf[64];
-
-	uint8_t print_len;
-	for (unsigned int start_index = 0; start_index < g_frame_len; start_index+=32) {
-		if ((g_frame_len - start_index) >= 32) {
-			print_len = 32;
-		} else {
-			print_len = (g_frame_len - start_index); // Print only remaining bytes
-			char_buf[print_len*2] = '\0'; // Null terminate, for usb_puts strnlen.
-		}
-		buf_to_hexstring(g_ethernet_frame, char_buf, start_index, start_index + print_len - 1);
-		usb_puts(char_buf);
-		udelay_busy(USB_PUTS_DELAY_USEC);
-	}
-
-	g_frame_len = 0;
-}
-*/
-
 static void cdcncm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 {
 	(void)ep;
     (void)usbd_dev;
-
-    gpio_toggle(LED_RED_PORT, LED_RED_PIN);   /* RX activity */
 
     uint8_t packet_buf[64];
     uint16_t len = usbd_ep_read_packet(usbd_dev, CDC_NCM_DATA_OUT_EP, packet_buf, sizeof(packet_buf));
@@ -613,8 +628,7 @@ static void cdcncm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
     }
 
     /* Append this packet to the current NTB */
-    if (ntb_rx_len + len > sizeof(ntb_rx_buf)) {
-        // usb_puts("\r\nNTB overflow\r\n");
+    if (ntb_rx_len + len > sizeof(ntb_rx_buf)) { // Overflow
         ntb_rx_len = 0;
         return;
     }
@@ -663,6 +677,8 @@ static void cdc_altsetting_cc(usbd_device *usbd_dev, uint16_t wIndex, uint16_t w
 		.ulbitrate = 10000000, // 10 Mbps
 	};
 
+	// TODO: Refactor enpoint writing to a function to avoid duplicating this loop
+
 	return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_NOTIFY_EP, &speed, sizeof(speed));
 	// The endpoint might be busy transmitting, wait a little and retry.
 	while (!return_value) {
@@ -687,6 +703,9 @@ static void cdc_altsetting_cc(usbd_device *usbd_dev, uint16_t wIndex, uint16_t w
 	}
 
 	gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN);   // solid green = link up
+
+	rx_count = 0;
+	tx_count = 0;
 
 	// TODO: Implement reset logic, as specified in NCM 1.1:
 	// 9.2 Using Alternate Settings to Reset an NCM Function
@@ -738,7 +757,7 @@ void sys_tick_handler(void)
 	static uint16_t tick_counter = 0;
 
 	if (tick_counter >= 5000) { // Every 5 seconds
-		// usb_puts("\r\nSysTick\r\n");
+		send_udp_debug();
 		tick_counter = 0;
 	}
 	
