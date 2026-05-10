@@ -579,7 +579,9 @@ static void send_udp_debug(void)
 /* Minimal NTB-16 parser - called only when a complete NTB has been received */
 static void ncm_parse_and_echo_ntb(void)
 {
-    if (ntb_rx_len < 12) return;
+	if (ntb_rx_len < 12) {
+		goto reset;
+	}
 
     /* Check NTH16 signature "NCMH" */
     if (ntb_rx_buf[0] != 'N' || ntb_rx_buf[1] != 'C' || ntb_rx_buf[2] != 'M' || ntb_rx_buf[3] != 'H') {
@@ -608,75 +610,70 @@ static void ncm_parse_and_echo_ntb(void)
 
     // Valid Ethernet frame
 	rx_count++;
-	gpio_toggle(LED_RED_PORT, LED_RED_PIN); // TODO: Debug
+	gpio_toggle(LED_RED_PORT, LED_RED_PIN); // Toggle Red LED for frame Rx
 
-	uint8_t* packet = &ntb_rx_buf[frame_offset];
+	uint8_t *eth = &ntb_rx_buf[frame_offset];
+    uint16_t eth_type = (eth[12] << 8) | eth[13];
 
-	/* Check for ARP request for our IP */
-    if (frame_len >= 42 && 
-        packet[12] == 0x08 && packet[13] == 0x06 &&           // EtherType ARP
-        packet[21] == 0x01 &&                                 // opcode = request
-        memcmp(packet + 38, g_server_ip_address, 4) == 0) {   // target IP = ours
-        
-        /* Build ARP reply */
-        uint8_t arp_reply[42];
-		memcpy(arp_reply, g_mac_address, 6);                // dst = host
-        memcpy(arp_reply + 6, g_server_mac_address, 6);     // src = us		
-        arp_reply[12] = 0x08; arp_reply[13] = 0x06;         // EtherType ARP
-        arp_reply[14] = 0x00; arp_reply[15] = 0x01;         // HW type Ethernet
-        arp_reply[16] = 0x08; arp_reply[17] = 0x00;         // protocol IP
-        arp_reply[18] = 6; arp_reply[19] = 4;               // HW / proto length
-        arp_reply[20] = 0x00; arp_reply[21] = 0x02;         // opcode = reply
-        memcpy(arp_reply + 22, g_server_mac_address, 6);    // sender MAC
-        memcpy(arp_reply + 28, g_server_ip_address, 4);     // sender IP
-        memcpy(arp_reply + 32, packet + 22, 6);           	// target MAC (request sender MAC)
-        memcpy(arp_reply + 38, packet + 28, 4);             // target IP (request sender IP)
+	switch (eth_type) {
+    case 0x0806: /* ARP */
+        if (frame_len >= 42 &&
+            eth[21] == 0x01 && // Opcode == request
+            memcmp(eth + 38, g_server_ip_address, 4) == 0) { // target IP = ours
 
-        ncm_send_frame(arp_reply, 42);
-        goto reset;
+            uint8_t arp[42];
+            memcpy(arp, eth + 6, 6); // Destination = Sender MAC
+            memcpy(arp + 6, g_server_mac_address, 6); // Source MAC
+            arp[12] = 0x08; arp[13] = 0x06; // EtherType ARP
+            arp[14] = 0x00; arp[15] = 0x01; // HW type Ethernet
+            arp[16] = 0x08; arp[17] = 0x00; // protocol IP
+            arp[18] = 6; arp[19] = 4; // HW / proto length
+            arp[20] = 0x00; arp[21] = 0x02; // opcode = reply
+            memcpy(arp + 22, g_server_mac_address, 6); // sender MAC
+            memcpy(arp + 28, g_server_ip_address, 4); // sender IP
+            memcpy(arp + 32, eth + 22, 6); // target MAC (request sender MAC)
+            memcpy(arp + 38, eth + 28, 4); // target IP (request sender IP)
+
+            ncm_send_frame(arp, 42);
+        }
+        break;
+
+    case 0x0800: /* IPv4 */
+        if (frame_len >= 42 && frame_len <= MAX_ICMP_FRAME &&
+            eth[23] == 0x01 && // IP protocol == ICMP
+            eth[34] == 0x08 && // ICMP type == Echo Request
+            memcmp(eth + 30, g_server_ip_address, 4) == 0) { // dst IP == us
+
+            uint8_t reply[frame_len];
+            memcpy(reply, eth, frame_len);
+
+			// Swap MACs (Host NIC <-> Tomu server)
+            memcpy(reply, eth + 6, 6); // dst = original src
+            memcpy(reply + 6, g_server_mac_address, 6); // src = us
+            // Swap IPs
+			memcpy(reply + 26, eth + 30, 4); // src = our IP
+            memcpy(reply + 30, eth + 26, 4); // dst = original src IP
+
+            reply[34] = 0x00; // change to Echo Reply (type 0)
+
+            reply[24] = 0; reply[25] = 0;
+            uint16_t ip_csum = internet_checksum(reply + 14, 20);
+            reply[24] = ip_csum & 0xFF;
+            reply[25] = (ip_csum >> 8) & 0xFF;
+
+            reply[36] = 0; reply[37] = 0;
+            uint16_t icmp_csum = internet_checksum(reply + 34, frame_len - 34);
+            reply[36] = icmp_csum & 0xFF;
+            reply[37] = (icmp_csum >> 8) & 0xFF;
+
+            ncm_send_frame(reply, frame_len);
+        }
+        break;
+
+    default:
+        /* Unknown EtherType — drop */
+        break;
     }
-
-	/* ICMP Echo Request to our IP? (minimal valid frame = 42 bytes) */
-    if (frame_len >= 42 && frame_len <= MAX_ICMP_FRAME &&
-        packet[12] == 0x08 && packet[13] == 0x00 &&   /* EtherType = IPv4 */
-        packet[23] == 0x01 &&                          /* IP protocol = ICMP */
-        packet[34] == 0x08 &&                          /* ICMP type = Echo Request */
-        memcmp(packet + 30, g_server_ip_address, 4) == 0) {  /* dst IP == us */
-
-        uint8_t reply[frame_len];
-        memcpy(reply, packet, frame_len);
-
-        /* Swap MACs (Host NIC <-> Tomu server) */
-        memcpy(reply, packet + 6, 6);                    /* dst = original src */
-        memcpy(reply + 6, g_server_mac_address, 6);      /* src = us */
-
-        /* Swap IPs */
-        memcpy(reply + 26, packet + 30, 4);              /* src = our IP */
-        memcpy(reply + 30, packet + 26, 4);              /* dst = original src IP */
-
-        reply[34] = 0x00;   /* change to Echo Reply (type 0) */
-        /* code stays 0, identifier + sequence number are preserved by memcpy */
-
-        /* IP header checksum (field is at offset 24/25 in the IP header) */
-        reply[24] = 0;
-        reply[25] = 0;
-        uint16_t ip_csum = internet_checksum(reply + 14, 20);
-        reply[24] = ip_csum & 0xFF;
-        reply[25] = (ip_csum >> 8) & 0xFF;
-
-        /* ICMP checksum (over ICMP header + data) */
-        reply[36] = 0;
-        reply[37] = 0;
-        uint16_t icmp_csum = internet_checksum(reply + 34, frame_len - 34);
-        reply[36] = icmp_csum & 0xFF;
-        reply[37] = (icmp_csum >> 8) & 0xFF;
-
-        ncm_send_frame(reply, frame_len);
-        goto reset;
-    }
-
-	/* Echo the frame back as a proper NTB */
-    ncm_send_frame(ntb_rx_buf + frame_offset, frame_len);
 
 reset:
     ntb_rx_len = 0;   /* ready for next NTB */
