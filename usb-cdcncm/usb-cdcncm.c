@@ -86,6 +86,8 @@ TOBOOT_CONFIGURATION(0);
 #define CDC_NCM_COMM_INTERFACE_NUM 0
 #define CDC_NCM_DATA_INTERFACE_NUM 1
 
+#define MAX_ICMP_FRAME 128   // Plenty for normal pings (most are < 100 bytes total)
+
 struct usb_cdc_notification_header {
 	uint8_t bmRequestType;
 	uint8_t bNotificationCode;
@@ -635,7 +637,7 @@ static void ncm_parse_and_echo_ntb(void)
     }
 
 	/* ICMP Echo Request to our IP? (minimal valid frame = 42 bytes) */
-    if (frame_len >= 42 &&
+    if (frame_len >= 42 && frame_len <= MAX_ICMP_FRAME &&
         packet[12] == 0x08 && packet[13] == 0x00 &&   /* EtherType = IPv4 */
         packet[23] == 0x01 &&                          /* IP protocol = ICMP */
         packet[34] == 0x08 &&                          /* ICMP type = Echo Request */
