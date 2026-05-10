@@ -442,6 +442,28 @@ static void buf_to_hexstring(uint8_t* source, char* dest, unsigned int start_ind
 }
 */
 
+/* Internet checksum (RFC 1071 / RFC 791)
+ * Used for IPv4 header, ICMP, and (if needed later) UDP/TCP.
+ * The caller must zero the checksum field before calling.
+ */
+static uint16_t internet_checksum(const uint8_t *buf, size_t len)
+{
+    uint32_t sum = 0;
+    const uint16_t *p = (const uint16_t *)buf;
+
+    while (len > 1) {
+        sum += *p++;
+        len -= 2;
+    }
+    if (len) {
+        sum += *(const uint8_t *)p;
+    }
+
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    return ~sum;
+}
+
 /* Minimal NTB-16 TX helper - builds a one-frame NTB and sends it */
 static void ncm_send_frame(const uint8_t *frame, uint16_t frame_len)
 {
@@ -496,35 +518,36 @@ static void ncm_send_frame(const uint8_t *frame, uint16_t frame_len)
     gpio_toggle(LED_GREEN_PORT, LED_GREEN_PIN);  /* visual TX feedback */
 }
 
-/* Hard-coded UDP debug packet to 192.168.7.2:1234 */
+// UDP debug packet
 static void send_udp_debug(void)
 {
-    uint8_t packet[128];
+	uint8_t packet[128];
     uint16_t len = 0;
 
-    /* 1. Ethernet header (14 bytes) */
-    memcpy(packet + len, g_mac_address, 6);          len += 6;   // dst = host
-    memcpy(packet + len, g_server_mac_address, 6);           len += 6;   // src = us
-    packet[len++] = 0x08; packet[len++] = 0x00;            // EtherType = IPv4
+    /* Ethernet header (14 bytes) */
+    memcpy(packet + len, g_mac_address, 6);          len += 6;   // dst = Host NIC
+    memcpy(packet + len, g_server_mac_address, 6);   len += 6;   // src = Tomu (remote)
+    packet[len++] = 0x08; packet[len++] = 0x00;                 // EtherType = IPv4
 
-    /* 2. IPv4 header (20 bytes) */
+	/* IPv4 header (20 bytes) */
+    uint16_t ip_hdr_start = len;
     packet[len++] = 0x45; packet[len++] = 0x00;
     packet[len++] = 0x00; packet[len++] = 0x00;   // total length (fix later)
-    packet[len++] = 0x00; packet[len++] = 0x01;	  // Identification
+    packet[len++] = 0x00; packet[len++] = 0x01;   // Identification
     packet[len++] = 0x00; packet[len++] = 0x00;   // Flags + Fragment Offset
     packet[len++] = 0x40; packet[len++] = 0x11;   // TTL, protocol = UDP
-    packet[len++] = 0x00; packet[len++] = 0x00;   // Header Checksum (0 for now)
-    memcpy(packet + len, g_server_ip_address, 4); len += 4;    // src IP
-    memcpy(packet + len, g_host_ip_address, 4); len += 4;    // dst IP
+    packet[len++] = 0x00; packet[len++] = 0x00;   // checksum (zero for now)
+    memcpy(packet + len, g_server_ip_address, 4); len += 4;   // src IP
+    memcpy(packet + len, g_host_ip_address, 4);   len += 4;   // dst IP
 
-	/* 3. UDP header (8 bytes) */
+	/* UDP header (8 bytes) */
 	//TODO: Make destination port a constant define instead of hard-coded?
     packet[len++] = 0x04; packet[len++] = 0xD2;                 // src port 1234
     packet[len++] = 0x04; packet[len++] = 0xD2;                 // dst port 1234
     packet[len++] = 0x00; packet[len++] = 0x00;                 // UDP Length (fix later)
-    packet[len++] = 0x00; packet[len++] = 0x00;                 // UDP Checksum (0 for now)
+    packet[len++] = 0x00; packet[len++] = 0x00;                 // UDP checksum = 0 (allowed)
 
-	/* 4. Payload */
+	/* Payload */
     char status[16];
     strcpy((char*)packet + len, "RX:"); len += 3;
     itoa(rx_count, status, 10);
@@ -535,13 +558,18 @@ static void send_udp_debug(void)
     packet[len++] = '\r'; packet[len++] = '\n';
 
 	/* Fix lengths */
-    uint16_t ip_total = len - 14; // 14 bytes of Ethernet header
+    uint16_t ip_total = len - 14; // Skip 14 bytes of Ethernet header
     packet[16] = (ip_total >> 8) & 0xFF;
     packet[17] = ip_total & 0xFF;
 
     uint16_t udp_len = len - 34;   // 14 (Eth) + 20 (IP)
     packet[38] = (udp_len >> 8) & 0xFF;
     packet[39] = udp_len & 0xFF;
+
+	/* Calculate and insert IPv4 header checksum */
+    uint16_t csum = internet_checksum(packet + ip_hdr_start, 20);
+    packet[ip_hdr_start + 10] = csum & 0xFF;
+    packet[ip_hdr_start + 11] = (csum >> 8) & 0xFF;
 
     ncm_send_frame(packet, len);
 }
@@ -580,8 +608,9 @@ static void ncm_parse_and_echo_ntb(void)
 	rx_count++;
 	gpio_toggle(LED_RED_PORT, LED_RED_PIN); // TODO: Debug
 
-	/* Check for ARP request for our IP */
 	uint8_t* packet = &ntb_rx_buf[frame_offset];
+
+	/* Check for ARP request for our IP */
     if (frame_len >= 42 && 
         packet[12] == 0x08 && packet[13] == 0x06 &&           // EtherType ARP
         packet[21] == 0x01 &&                                 // opcode = request
@@ -602,6 +631,45 @@ static void ncm_parse_and_echo_ntb(void)
         memcpy(arp_reply + 38, packet + 28, 4);             // target IP (request sender IP)
 
         ncm_send_frame(arp_reply, 42);
+        goto reset;
+    }
+
+	/* ICMP Echo Request to our IP? (minimal valid frame = 42 bytes) */
+    if (frame_len >= 42 &&
+        packet[12] == 0x08 && packet[13] == 0x00 &&   /* EtherType = IPv4 */
+        packet[23] == 0x01 &&                          /* IP protocol = ICMP */
+        packet[34] == 0x08 &&                          /* ICMP type = Echo Request */
+        memcmp(packet + 30, g_server_ip_address, 4) == 0) {  /* dst IP == us */
+
+        uint8_t reply[frame_len];
+        memcpy(reply, packet, frame_len);
+
+        /* Swap MACs (Host NIC <-> Tomu server) */
+        memcpy(reply, packet + 6, 6);                    /* dst = original src */
+        memcpy(reply + 6, g_server_mac_address, 6);      /* src = us */
+
+        /* Swap IPs */
+        memcpy(reply + 26, packet + 30, 4);              /* src = our IP */
+        memcpy(reply + 30, packet + 26, 4);              /* dst = original src IP */
+
+        reply[34] = 0x00;   /* change to Echo Reply (type 0) */
+        /* code stays 0, identifier + sequence number are preserved by memcpy */
+
+        /* IP header checksum (field is at offset 24/25 in the IP header) */
+        reply[24] = 0;
+        reply[25] = 0;
+        uint16_t ip_csum = internet_checksum(reply + 14, 20);
+        reply[24] = ip_csum & 0xFF;
+        reply[25] = (ip_csum >> 8) & 0xFF;
+
+        /* ICMP checksum (over ICMP header + data) */
+        reply[36] = 0;
+        reply[37] = 0;
+        uint16_t icmp_csum = internet_checksum(reply + 34, frame_len - 34);
+        reply[36] = icmp_csum & 0xFF;
+        reply[37] = (icmp_csum >> 8) & 0xFF;
+
+        ncm_send_frame(reply, frame_len);
         goto reset;
     }
 
