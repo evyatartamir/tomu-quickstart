@@ -87,6 +87,7 @@ TOBOOT_CONFIGURATION(0);
 #define CDC_NCM_DATA_INTERFACE_NUM 1
 
 #define MAX_ICMP_FRAME 128   // Plenty for normal pings (most are < 100 bytes total)
+#define MAX_TCP_FRAME 256   // For HTTP response
 
 struct usb_cdc_notification_header {
 	uint8_t bmRequestType;
@@ -353,6 +354,10 @@ static uint8_t g_server_ip_address[4] = {192, 168, 7, 1};
 
 static uint32_t rx_count = 0, tx_count = 0;
 
+/* Simple TCP connection state for single client */
+static bool tcp_in_session = false;
+static uint32_t tcp_our_seq = 0x12345678;  /* Our initial sequence number */
+
 static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev, struct usb_setup_data *req, uint8_t **buf,
 		uint16_t *len, void (**complete)(usbd_device *usbd_dev, struct usb_setup_data *req))
 {
@@ -459,6 +464,33 @@ static uint16_t internet_checksum(const uint8_t *buf, size_t len)
     }
     if (len) {
         sum += *(const uint8_t *)p;
+    }
+
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    return ~sum;
+}
+
+/* TCP checksum (RFC 793) — pseudo-header + TCP header/data */
+static uint16_t tcp_checksum(const uint8_t *tcp_buf, uint16_t tcp_len,
+                             const uint8_t *src_ip, const uint8_t *dst_ip)
+{
+    uint32_t sum = 0;
+
+    /* Pseudo header (src IP, dst IP, 0, proto=6, TCP len) */
+    sum += (src_ip[0] << 8) | src_ip[1];
+    sum += (src_ip[2] << 8) | src_ip[3];
+    sum += (dst_ip[0] << 8) | dst_ip[1];
+    sum += (dst_ip[2] << 8) | dst_ip[3];
+    sum += 0x0006;   /* protocol = TCP */
+    sum += tcp_len;
+
+    /* TCP header + payload */
+    for (uint16_t i = 0; i < tcp_len; i += 2) {
+        if (i + 1 < tcp_len)
+            sum += (tcp_buf[i] << 8) | tcp_buf[i + 1];
+        else
+            sum += tcp_buf[i] << 8;
     }
 
     sum = (sum >> 16) + (sum & 0xFFFF);
@@ -576,6 +608,169 @@ static void send_udp_debug(void)
     ncm_send_frame(packet, len);
 }
 
+/* Send TCP SYN-ACK for port 80 with Timestamp echo (required by modern clients) */
+static void send_tcp_syn_ack(uint8_t *incoming_eth, uint32_t client_seq)
+{
+    uint8_t packet[80];   // 54 (base) + 12 (options) + padding = safe
+    uint16_t len = 0;
+
+    /* Ethernet header — swap MACs */
+    memcpy(packet + len, incoming_eth + 6, 6); len += 6;
+    memcpy(packet + len, g_server_mac_address, 6); len += 6;
+    packet[len++] = 0x08; packet[len++] = 0x00; /* IPv4 */
+
+    /* IP header (20 bytes) */
+    uint16_t ip_start = len;
+    packet[len++] = 0x45;
+    packet[len++] = 0x00;
+    packet[len++] = 0x00; packet[len++] = 0x34; /* total = 52 (20 IP + 32 TCP) */
+    packet[len++] = 0x00; packet[len++] = 0x06;
+    packet[len++] = 0x00; packet[len++] = 0x00;
+    packet[len++] = 0x40; packet[len++] = 0x06;
+    packet[len++] = 0x00; packet[len++] = 0x00;
+    memcpy(packet + len, g_server_ip_address, 4); len += 4;
+    memcpy(packet + len, incoming_eth + 14 + 12, 4); len += 4;
+
+    /* TCP header base (20 bytes) + Timestamp option (12 bytes) = 32 bytes */
+    uint16_t tcp_start = len;
+    packet[len++] = 0x00; packet[len++] = 0x50; /* src port 80 */
+    packet[len++] = incoming_eth[34]; packet[len++] = incoming_eth[35]; /* dst port */
+
+    /* Our seq (fixed for demo) */
+    static uint32_t our_seq = 0x12345678;
+    packet[len++] = (our_seq >> 24) & 0xFF;
+    packet[len++] = (our_seq >> 16) & 0xFF;
+    packet[len++] = (our_seq >> 8) & 0xFF;
+    packet[len++] = our_seq & 0xFF;
+
+    /* Ack = client_seq + 1 */
+    uint32_t ack = client_seq + 1;
+    packet[len++] = (ack >> 24) & 0xFF;
+    packet[len++] = (ack >> 16) & 0xFF;
+    packet[len++] = (ack >> 8) & 0xFF;
+    packet[len++] = ack & 0xFF;
+
+    packet[len++] = 0x80; /* data offset = 32 bytes (8 << 4) */
+    packet[len++] = 0x12; /* SYN + ACK */
+
+    packet[len++] = 0x16; packet[len++] = 0xD0; /* window = 5840 */
+
+    packet[len++] = 0x00; packet[len++] = 0x00; /* checksum placeholder */
+    packet[len++] = 0x00; packet[len++] = 0x00; /* urgent */
+
+    /* TCP options: NOP NOP Timestamp (kind=8, len=10) */
+    packet[len++] = 0x01; /* NOP */
+    packet[len++] = 0x01; /* NOP */
+    packet[len++] = 0x08; /* Timestamp */
+    packet[len++] = 0x0A; /* Length 10 */
+
+    /* Server TSval (can be 0 or a counter) */
+    packet[len++] = 0x00; packet[len++] = 0x00; packet[len++] = 0x00; packet[len++] = 0x00;
+
+    /* TSecr = echo client's TSval from the SYN (simple offset for common layout) */
+    uint32_t client_tsval = 0;
+    uint8_t *tcp_opts = incoming_eth + 14 + 20 + 20; /* after Eth + IP + TCP base */
+    if (tcp_opts[0] == 0x02 && tcp_opts[1] == 0x04 &&   /* MSS */
+        tcp_opts[4] == 0x04 && tcp_opts[5] == 0x02 &&   /* SACK */
+        tcp_opts[6] == 0x08 && tcp_opts[7] == 0x0A) {   /* Timestamp */
+        client_tsval = ((uint32_t)tcp_opts[8] << 24) |
+                       ((uint32_t)tcp_opts[9] << 16) |
+                       ((uint32_t)tcp_opts[10] << 8) |
+                       tcp_opts[11];
+    }
+    packet[len++] = (client_tsval >> 24) & 0xFF;
+    packet[len++] = (client_tsval >> 16) & 0xFF;
+    packet[len++] = (client_tsval >> 8) & 0xFF;
+    packet[len++] = client_tsval & 0xFF;
+
+    /* Fix IP checksum */
+    uint16_t ip_csum = internet_checksum(packet + ip_start, 20);
+    packet[ip_start + 10] = ip_csum & 0xFF;
+    packet[ip_start + 11] = (ip_csum >> 8) & 0xFF;
+
+    /* Fix TCP checksum (now 32 bytes header) */
+    uint16_t tcp_csum = tcp_checksum(packet + tcp_start, 32,
+                                     g_server_ip_address, incoming_eth + 14 + 12);
+	packet[tcp_start + 16] = (tcp_csum >> 8) & 0xFF;  // high byte first (network order)
+	packet[tcp_start + 17] = tcp_csum & 0xFF;         // low byte second
+
+    ncm_send_frame(packet, len);
+}
+
+/* Send a minimal HTTP "Hello, World!" response */
+static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint32_t client_ack, uint16_t payload_len)
+{
+	(void)client_ack;   /* unused in this minimal single-shot HTTP responder */
+
+    uint8_t packet[MAX_TCP_FRAME];
+    uint16_t len = 0;
+
+    const char *response =
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 48\r\n"
+        "\r\n"
+        "<html><body><h1>Hello, World!</h1></body></html>";
+
+    uint16_t tcp_payload_len = strlen(response);
+    uint16_t tcp_header_len = 20;
+    uint16_t tcp_total = tcp_header_len + tcp_payload_len;
+
+    /* Ethernet header — swap MACs (client <-> Tomu server) */
+    memcpy(packet + len, incoming_eth + 6, 6); len += 6;
+    memcpy(packet + len, g_server_mac_address, 6); len += 6;
+    packet[len++] = 0x08; packet[len++] = 0x00; /* IPv4 */
+
+    /* IP header */
+    uint16_t ip_start = len;
+    packet[len++] = 0x45;
+    packet[len++] = 0x00;
+    packet[len++] = (20 + tcp_total) >> 8; packet[len++] = (20 + tcp_total) & 0xFF;
+    packet[len++] = 0x00; packet[len++] = 0x05;
+    packet[len++] = 0x00; packet[len++] = 0x00;
+    packet[len++] = 0x40; packet[len++] = 0x06;
+    packet[len++] = 0x00; packet[len++] = 0x00;
+    memcpy(packet + len, g_server_ip_address, 4); len += 4;
+    memcpy(packet + len, incoming_eth + 14 + 12, 4); len += 4;
+
+    /* TCP header (ACK + PSH + FIN) */
+    uint16_t tcp_start = len;
+    packet[len++] = 0x00; packet[len++] = 0x50; /* src port 80 */
+    packet[len++] = incoming_eth[34]; packet[len++] = incoming_eth[35];
+    uint32_t our_seq = tcp_our_seq + 1;
+    packet[len++] = (our_seq >> 24) & 0xFF;
+    packet[len++] = (our_seq >> 16) & 0xFF;
+    packet[len++] = (our_seq >> 8) & 0xFF;
+    packet[len++] = our_seq & 0xFF;
+    uint32_t ack_val = client_seq + payload_len;  /* fixed: no extra +1 */
+    packet[len++] = (ack_val >> 24) & 0xFF;
+    packet[len++] = (ack_val >> 16) & 0xFF;
+    packet[len++] = (ack_val >> 8) & 0xFF;
+    packet[len++] = ack_val & 0xFF;
+    packet[len++] = 0x50;
+    packet[len++] = 0x19; /* ACK + PSH + FIN */
+    packet[len++] = 0x00; packet[len++] = 0x00;
+    packet[len++] = 0x00; packet[len++] = 0x00;
+    packet[len++] = 0x00; packet[len++] = 0x00;
+
+    /* HTTP payload */
+    memcpy(packet + len, response, tcp_payload_len); len += tcp_payload_len;
+
+    /* Fix checksums */
+    uint16_t ip_csum = internet_checksum(packet + ip_start, 20);
+    packet[ip_start + 10] = ip_csum & 0xFF;
+    packet[ip_start + 11] = (ip_csum >> 8) & 0xFF;
+
+    uint16_t tcp_csum = tcp_checksum(packet + tcp_start, tcp_total,
+                                     g_server_ip_address, incoming_eth + 14 + 12);
+
+	packet[tcp_start + 16] = (tcp_csum >> 8) & 0xFF;
+	packet[tcp_start + 17] = tcp_csum & 0xFF;
+    
+    ncm_send_frame(packet, len);
+    tcp_in_session = false;
+}
+
 /* Minimal NTB-16 parser - called only when a complete NTB has been received */
 static void ncm_parse_and_echo_ntb(void)
 {
@@ -667,7 +862,34 @@ static void ncm_parse_and_echo_ntb(void)
             reply[37] = (icmp_csum >> 8) & 0xFF;
 
             ncm_send_frame(reply, frame_len);
-        }
+        } else if (eth[23] == 0x06) { /* TCP */
+			uint8_t ip_header_len = (eth[14] & 0x0F) * 4;
+			uint8_t *tcp = eth + 14 + ip_header_len;
+
+			uint16_t dst_port = (tcp[2] << 8) | tcp[3];
+			if (dst_port == 80) {
+				uint8_t flags = tcp[13];
+				uint32_t seq = ((uint32_t)tcp[4] << 24) |
+							((uint32_t)tcp[5] << 16) |
+							((uint32_t)tcp[6] << 8) |
+							tcp[7];
+				uint32_t ack = ((uint32_t)tcp[8] << 24) |
+							((uint32_t)tcp[9] << 16) |
+							((uint32_t)tcp[10] << 8) |
+							tcp[11];
+				uint16_t tcp_hdr_len = ((tcp[12] >> 4) & 0x0F) * 4;
+				uint8_t *payload = tcp + tcp_hdr_len;
+				uint16_t payload_len = frame_len - (14 + ip_header_len + tcp_hdr_len);
+
+				if (flags & 0x02) { /* SYN */
+					send_tcp_syn_ack(eth, seq);
+				} else if ((flags & 0x10) && payload_len > 4) { /* ACK + data */
+					if (strncmp((char*)payload, "GET ", 4) == 0) {
+						send_http_response(eth, seq, ack, payload_len);
+					}
+				}
+			}
+   		}
         break;
 
     default:
