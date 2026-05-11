@@ -353,6 +353,7 @@ static uint8_t g_host_ip_address[4] = {192, 168, 7, 2};
 static uint8_t g_server_ip_address[4] = {192, 168, 7, 1};
 
 static uint32_t rx_count = 0, tx_count = 0;
+static uint32_t uptime_seconds = 0;
 
 /* Simple TCP connection state for single client */
 static bool tcp_in_session = false;
@@ -709,13 +710,29 @@ static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint3
     char html[160];          // plenty for this page
     uint16_t hlen = 0;
 
-    strcpy(html + hlen, "<html><body style='font-family:monospace;background:#111;color:#0f0'>"); hlen += strlen(html + hlen);
-    strcpy(html + hlen, "<h1>Tomu NCM</h1>"); hlen += strlen(html + hlen);
-    strcpy(html + hlen, "<p>rx="); hlen += strlen(html + hlen);
-    itoa(rx_count, html + hlen, 10); hlen += strlen(html + hlen);
-    strcpy(html + hlen, " tx="); hlen += strlen(html + hlen);
-    itoa(tx_count, html + hlen, 10); hlen += strlen(html + hlen);
-    strcpy(html + hlen, "</p><p><small>USB CDC-NCM on EFM32HG309</small></p></body></html>"); hlen += strlen(html + hlen);
+	strcpy(html + hlen, "<html><body style='font-family:monospace;background:#111;color:#0f0'>"); hlen += strlen(html + hlen);
+	strcpy(html + hlen, "<h1>Tomu NCM</h1>"); hlen += strlen(html + hlen);
+	strcpy(html + hlen, "<p>rx="); hlen += strlen(html + hlen);
+	itoa(rx_count, html + hlen, 10); hlen += strlen(html + hlen);
+	strcpy(html + hlen, " tx="); hlen += strlen(html + hlen);
+	itoa(tx_count, html + hlen, 10); hlen += strlen(html + hlen);
+	strcpy(html + hlen, "</p><p>Uptime: "); hlen += strlen(html + hlen);
+
+	/* Format uptime as HH:MM:SS */
+	uint32_t h = uptime_seconds / 3600;
+	uint32_t m = (uptime_seconds % 3600) / 60;
+	uint32_t s = uptime_seconds % 60;
+
+	char timebuf[16];
+	itoa(h, timebuf, 10); strcpy(html + hlen, timebuf); hlen += strlen(timebuf);
+	strcpy(html + hlen, ":"); hlen += 1;
+	if (m < 10) { strcpy(html + hlen, "0"); hlen += 1; }
+	itoa(m, timebuf, 10); strcpy(html + hlen, timebuf); hlen += strlen(timebuf);
+	strcpy(html + hlen, ":"); hlen += 1;
+	if (s < 10) { strcpy(html + hlen, "0"); hlen += 1; }
+	itoa(s, timebuf, 10); strcpy(html + hlen, timebuf); hlen += strlen(timebuf);
+
+	strcpy(html + hlen, "</p><p><small>USB CDC-NCM on EFM32HG309</small></p></body></html>"); hlen += strlen(html + hlen);
 
     /* Full HTTP response header + body */
     char response[256];
@@ -1058,12 +1075,16 @@ void sys_tick_handler(void)
 
 	static uint16_t tick_counter = 0;
 
-	if (tick_counter >= 5000) { // Every 5 seconds
-		send_udp_debug();
-		tick_counter = 0;
-	}
-	
-	++tick_counter;
+	tick_counter++;
+
+    if (tick_counter >= 1000) {           // every second
+        uptime_seconds++;
+        tick_counter = 0;
+    }
+
+    if ((tick_counter == 0) && (uptime_seconds % 5 == 0)) {   // every 5 seconds
+        send_udp_debug();
+    }
 }
 
 int main(void)
