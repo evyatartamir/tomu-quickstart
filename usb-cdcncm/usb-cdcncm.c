@@ -697,26 +697,40 @@ static void send_tcp_syn_ack(uint8_t *incoming_eth, uint32_t client_seq)
     ncm_send_frame(packet, len);
 }
 
-/* Send a minimal HTTP "Hello, World!" response */
+/* Send HTTP response with live rx/tx counters (manual string build to save ROM) */
 static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint32_t client_ack, uint16_t payload_len)
 {
-	(void)client_ack;   /* unused in this minimal single-shot HTTP responder */
+    (void)client_ack;
 
     uint8_t packet[MAX_TCP_FRAME];
     uint16_t len = 0;
 
-    const char *response =
-        "HTTP/1.0 200 OK\r\n"
-        "Content-Type: text/html\r\n"
-        "Content-Length: 48\r\n"
-        "\r\n"
-        "<html><body><h1>Hello, World!</h1></body></html>";
+    /* Build dynamic HTML manually (same style as send_udp_debug) */
+    char html[160];          // plenty for this page
+    uint16_t hlen = 0;
 
-    uint16_t tcp_payload_len = strlen(response);
+    strcpy(html + hlen, "<html><body style='font-family:monospace;background:#111;color:#0f0'>"); hlen += strlen(html + hlen);
+    strcpy(html + hlen, "<h1>Tomu NCM</h1>"); hlen += strlen(html + hlen);
+    strcpy(html + hlen, "<p>rx="); hlen += strlen(html + hlen);
+    itoa(rx_count, html + hlen, 10); hlen += strlen(html + hlen);
+    strcpy(html + hlen, " tx="); hlen += strlen(html + hlen);
+    itoa(tx_count, html + hlen, 10); hlen += strlen(html + hlen);
+    strcpy(html + hlen, "</p><p><small>USB CDC-NCM on EFM32HG309</small></p></body></html>"); hlen += strlen(html + hlen);
+
+    /* Full HTTP response header + body */
+    char response[256];
+    uint16_t rlen = 0;
+
+    strcpy(response + rlen, "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: "); rlen += strlen(response + rlen);
+    itoa(hlen, response + rlen, 10); rlen += strlen(response + rlen);
+    strcpy(response + rlen, "\r\n\r\n"); rlen += strlen(response + rlen);
+    memcpy(response + rlen, html, hlen); rlen += hlen;
+
+    uint16_t tcp_payload_len = rlen;
     uint16_t tcp_header_len = 20;
     uint16_t tcp_total = tcp_header_len + tcp_payload_len;
 
-    /* Ethernet header — swap MACs (client <-> Tomu server) */
+    /* Ethernet header */
     memcpy(packet + len, incoming_eth + 6, 6); len += 6;
     memcpy(packet + len, g_server_mac_address, 6); len += 6;
     packet[len++] = 0x08; packet[len++] = 0x00; /* IPv4 */
@@ -726,7 +740,7 @@ static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint3
     packet[len++] = 0x45;
     packet[len++] = 0x00;
     packet[len++] = (20 + tcp_total) >> 8; packet[len++] = (20 + tcp_total) & 0xFF;
-    packet[len++] = 0x00; packet[len++] = 0x05;
+    packet[len++] = 0x00; packet[len++] = 0x06;
     packet[len++] = 0x00; packet[len++] = 0x00;
     packet[len++] = 0x40; packet[len++] = 0x06;
     packet[len++] = 0x00; packet[len++] = 0x00;
@@ -735,38 +749,37 @@ static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint3
 
     /* TCP header (ACK + PSH + FIN) */
     uint16_t tcp_start = len;
-    packet[len++] = 0x00; packet[len++] = 0x50; /* src port 80 */
+    packet[len++] = 0x00; packet[len++] = 0x50;
     packet[len++] = incoming_eth[34]; packet[len++] = incoming_eth[35];
     uint32_t our_seq = tcp_our_seq + 1;
     packet[len++] = (our_seq >> 24) & 0xFF;
     packet[len++] = (our_seq >> 16) & 0xFF;
     packet[len++] = (our_seq >> 8) & 0xFF;
     packet[len++] = our_seq & 0xFF;
-    uint32_t ack_val = client_seq + payload_len;  /* fixed: no extra +1 */
+    uint32_t ack_val = client_seq + payload_len;
     packet[len++] = (ack_val >> 24) & 0xFF;
     packet[len++] = (ack_val >> 16) & 0xFF;
     packet[len++] = (ack_val >> 8) & 0xFF;
     packet[len++] = ack_val & 0xFF;
     packet[len++] = 0x50;
-    packet[len++] = 0x19; /* ACK + PSH + FIN */
+    packet[len++] = 0x19;
     packet[len++] = 0x00; packet[len++] = 0x00;
     packet[len++] = 0x00; packet[len++] = 0x00;
     packet[len++] = 0x00; packet[len++] = 0x00;
 
-    /* HTTP payload */
+    /* Payload */
     memcpy(packet + len, response, tcp_payload_len); len += tcp_payload_len;
 
-    /* Fix checksums */
+    /* Checksums */
     uint16_t ip_csum = internet_checksum(packet + ip_start, 20);
     packet[ip_start + 10] = ip_csum & 0xFF;
     packet[ip_start + 11] = (ip_csum >> 8) & 0xFF;
 
     uint16_t tcp_csum = tcp_checksum(packet + tcp_start, tcp_total,
                                      g_server_ip_address, incoming_eth + 14 + 12);
+    packet[tcp_start + 16] = (tcp_csum >> 8) & 0xFF;
+    packet[tcp_start + 17] = tcp_csum & 0xFF;
 
-	packet[tcp_start + 16] = (tcp_csum >> 8) & 0xFF;
-	packet[tcp_start + 17] = tcp_csum & 0xFF;
-    
     ncm_send_frame(packet, len);
     tcp_in_session = false;
 }
