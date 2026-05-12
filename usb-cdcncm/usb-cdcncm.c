@@ -89,8 +89,6 @@ TOBOOT_CONFIGURATION(0);
 
 #define MAX_ICMP_FRAME 128   // Plenty for normal pings (most are < 100 bytes total)
 #define MAX_TCP_FRAME 512   // Must contain HTTP response
-#define MAX_HTTP_RESPONSE 384
-#define MAX_HTML_BUF 256
 
 struct usb_cdc_notification_header {
 	uint8_t bmRequestType;
@@ -140,10 +138,7 @@ static volatile uint16_t ntb_rx_len = 0; // TODO: should this be volatile?
 // TODO: 2048 bytes matches our advertised dwNtbOutMaxSize, although we only used headers (12+16) + Ethernet frame (1514)
 // TODO: Perhaps this can be reduced to 1542 from 2048? Consider alignment.
 static uint8_t ntb_tx_buf[600];
-
-static char html_buf[MAX_HTML_BUF];
-static char http_response[MAX_HTTP_RESPONSE];
-static uint8_t tcp_packet[MAX_TCP_FRAME];
+static uint8_t tcp_packet[MAX_TCP_FRAME]; // Must be smaller than ntb_tx_buf - NCM headers
 
 static const struct usb_device_descriptor dev = {
 	.bLength = USB_DT_DEVICE_SIZE,
@@ -698,62 +693,19 @@ static void send_tcp_syn_ack(uint8_t *incoming_eth, uint32_t client_seq)
     ncm_send_frame(sync_ack_packet, len);
 }
 
-/* Send HTTP response with live rx/tx counters (manual string build to save ROM) */
 static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint32_t client_ack, uint16_t payload_len)
 {
     (void)client_ack;
-
     uint16_t len = 0;
 
-    /* Build dynamic HTML manually (same style as send_udp_debug) */
-    uint16_t hlen = 0;
-
-	strcpy(html_buf + hlen, "<html><body style='font-family:monospace;background:#111;color:#0f0'>"); hlen += strlen(html_buf + hlen);
-	strcpy(html_buf + hlen, "<h1>Tomu NCM</h1>"); hlen += strlen(html_buf + hlen);
-	strcpy(html_buf + hlen, "<p>rx="); hlen += strlen(html_buf + hlen);
-	itoa(rx_count, html_buf + hlen, 10); hlen += strlen(html_buf + hlen);
-	strcpy(html_buf + hlen, " tx="); hlen += strlen(html_buf + hlen);
-	itoa(tx_count, html_buf + hlen, 10); hlen += strlen(html_buf + hlen);
-	strcpy(html_buf + hlen, "</p><p>Uptime: "); hlen += strlen(html_buf + hlen);
-
-	/* Format uptime as HH:MM:SS */
-	uint32_t h = uptime_seconds / 3600;
-	uint32_t m = (uptime_seconds % 3600) / 60;
-	uint32_t s = uptime_seconds % 60;
-
-	char timebuf[16];
-	itoa(h, timebuf, 10); strcpy(html_buf + hlen, timebuf); hlen += strlen(timebuf);
-	strcpy(html_buf + hlen, ":"); hlen += 1;
-	if (m < 10) { strcpy(html_buf + hlen, "0"); hlen += 1; }
-	itoa(m, timebuf, 10); strcpy(html_buf + hlen, timebuf); hlen += strlen(timebuf);
-	strcpy(html_buf + hlen, ":"); hlen += 1;
-	if (s < 10) { strcpy(html_buf + hlen, "0"); hlen += 1; }
-	itoa(s, timebuf, 10); strcpy(html_buf + hlen, timebuf); hlen += strlen(timebuf);
-
-	strcpy(html_buf + hlen, "</p><p><small>USB CDC-NCM on EFM32HG309</small></p></body></html>"); hlen += strlen(html_buf + hlen);
-
-    /* Full HTTP response header + body */
-    uint16_t rlen = 0;
-
-    strcpy(http_response + rlen, "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: "); rlen += strlen(http_response + rlen);
-    itoa(hlen, http_response + rlen, 10); rlen += strlen(http_response + rlen);
-    strcpy(http_response + rlen, "\r\n\r\n"); rlen += strlen(http_response + rlen);
-    memcpy(http_response + rlen, html_buf, hlen); rlen += hlen;
-
-    uint16_t tcp_payload_len = rlen;
-    uint16_t tcp_header_len = 20;
-    uint16_t tcp_total = tcp_header_len + tcp_payload_len;
-
-    /* Ethernet header */
+    /* Ethernet + IP + TCP headers (same as before) */
     memcpy(tcp_packet + len, incoming_eth + 6, 6); len += 6;
     memcpy(tcp_packet + len, g_server_mac_address, 6); len += 6;
-    tcp_packet[len++] = 0x08; tcp_packet[len++] = 0x00; /* IPv4 */
+    tcp_packet[len++] = 0x08; tcp_packet[len++] = 0x00;
 
-    /* IP header */
     uint16_t ip_start = len;
-    tcp_packet[len++] = 0x45;
-    tcp_packet[len++] = 0x00;
-    tcp_packet[len++] = (20 + tcp_total) >> 8; tcp_packet[len++] = (20 + tcp_total) & 0xFF;
+    tcp_packet[len++] = 0x45; tcp_packet[len++] = 0x00;
+    tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00; /* placeholder */
     tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x06;
     tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
     tcp_packet[len++] = 0x40; tcp_packet[len++] = 0x06;
@@ -761,34 +713,89 @@ static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint3
     memcpy(tcp_packet + len, g_server_ip_address, 4); len += 4;
     memcpy(tcp_packet + len, incoming_eth + 14 + 12, 4); len += 4;
 
-    /* TCP header (ACK + PSH + FIN) */
     uint16_t tcp_start = len;
     tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x50;
     tcp_packet[len++] = incoming_eth[34]; tcp_packet[len++] = incoming_eth[35];
+
     uint32_t our_seq = tcp_our_seq + 1;
     tcp_packet[len++] = (our_seq >> 24) & 0xFF;
     tcp_packet[len++] = (our_seq >> 16) & 0xFF;
     tcp_packet[len++] = (our_seq >> 8) & 0xFF;
     tcp_packet[len++] = our_seq & 0xFF;
+
     uint32_t ack_val = client_seq + payload_len;
     tcp_packet[len++] = (ack_val >> 24) & 0xFF;
     tcp_packet[len++] = (ack_val >> 16) & 0xFF;
     tcp_packet[len++] = (ack_val >> 8) & 0xFF;
     tcp_packet[len++] = ack_val & 0xFF;
+
     tcp_packet[len++] = 0x50;
-    tcp_packet[len++] = 0x19;
-    tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
+    tcp_packet[len++] = 0x19;  // PSH + ACK + FIN
+    tcp_packet[len++] = 0x16; tcp_packet[len++] = 0xD0;
     tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
     tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
 
-    /* Payload */
-    memcpy(tcp_packet + len, http_response, tcp_payload_len); len += tcp_payload_len;
+    /* === Build HTTP header + HTML === */
+
+	/* Write header up to Content-Length: */
+    strcpy((char*)tcp_packet + len, 
+           "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: ");
+    len += strlen((char*)tcp_packet + len);
+
+    uint16_t content_length_value_pos = len;   // where the number will go
+
+    /* Build body right after (we'll shift it later) */
+    uint16_t body_start = len;
+
+    /* HTML body */
+    strcpy((char*)tcp_packet + len, "<html><body style='font-family:monospace;background:#111;color:#0f0'>"); len += strlen((char*)tcp_packet + len);
+    strcpy((char*)tcp_packet + len, "<h1>Tomu NCM</h1>"); len += strlen((char*)tcp_packet + len);
+    strcpy((char*)tcp_packet + len, "<p>rx="); len += strlen((char*)tcp_packet + len);
+    itoa(rx_count, (char*)tcp_packet + len, 10); len += strlen((char*)tcp_packet + len);
+    strcpy((char*)tcp_packet + len, " tx="); len += strlen((char*)tcp_packet + len);
+    itoa(tx_count, (char*)tcp_packet + len, 10); len += strlen((char*)tcp_packet + len);
+    strcpy((char*)tcp_packet + len, "</p><p>Uptime: "); len += strlen((char*)tcp_packet + len);
+
+    uint32_t h = uptime_seconds / 3600, m = (uptime_seconds % 3600)/60, s = uptime_seconds % 60;
+    char tb[16];
+    itoa(h, tb, 10); strcpy((char*)tcp_packet + len, tb); len += strlen(tb);
+    strcpy((char*)tcp_packet + len, ":"); len += 1;
+    if (m < 10) { strcpy((char*)tcp_packet + len, "0"); len += 1; }
+    itoa(m, tb, 10); strcpy((char*)tcp_packet + len, tb); len += strlen(tb);
+    strcpy((char*)tcp_packet + len, ":"); len += 1;
+    if (s < 10) { strcpy((char*)tcp_packet + len, "0"); len += 1; }
+    itoa(s, tb, 10); strcpy((char*)tcp_packet + len, tb); len += strlen(tb);
+
+    strcpy((char*)tcp_packet + len, "</p><p><small>USB CDC-NCM on EFM32HG309</small></p></body></html>");
+    len += strlen((char*)tcp_packet + len);
+
+    uint16_t body_len = len - body_start;
+
+    /* === Shift body to make room for number + \r\n\r\n === */
+    char clen[16];
+    int num_len = strlen(itoa(body_len, clen, 10));     // how many digits
+    int shift = num_len + 4;                    // digits + "\r\n\r\n"
+
+    memmove(tcp_packet + body_start + shift, tcp_packet + body_start, body_len);
+
+    /* Write the number and terminator into the gap */
+    memcpy(tcp_packet + content_length_value_pos, clen, num_len);
+    memcpy(tcp_packet + content_length_value_pos + num_len, "\r\n\r\n", 4);
+
+    /* Update len to cover the full header + body */
+    len = content_length_value_pos + num_len + 4 + body_len;
+
+    /* Fix IP length */
+    uint16_t ip_total = len - ip_start;
+    tcp_packet[ip_start + 2] = ip_total >> 8;
+    tcp_packet[ip_start + 3] = ip_total & 0xFF;
 
     /* Checksums */
     uint16_t ip_csum = internet_checksum(tcp_packet + ip_start, 20);
     tcp_packet[ip_start + 10] = ip_csum & 0xFF;
     tcp_packet[ip_start + 11] = (ip_csum >> 8) & 0xFF;
 
+    uint16_t tcp_total = len - tcp_start;
     uint16_t tcp_csum = tcp_checksum(tcp_packet + tcp_start, tcp_total,
                                      g_server_ip_address, incoming_eth + 14 + 12);
     tcp_packet[tcp_start + 16] = (tcp_csum >> 8) & 0xFF;
@@ -797,6 +804,7 @@ static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint3
     ncm_send_frame(tcp_packet, len);
     tcp_in_session = false;
 }
+
 
 /* Minimal NTB-16 parser - called only when a complete NTB has been received */
 static void ncm_parse_ntb(void)
@@ -835,7 +843,7 @@ static void ncm_parse_ntb(void)
 	if (led_visualization) {
     	gpio_toggle(LED_RED_PORT, LED_RED_PIN); // Toggle Red LED for frame Rx
 	}
-	
+
 	uint8_t *eth = &ntb_rx_buf[frame_offset];
     uint16_t eth_type = (eth[12] << 8) | eth[13];
 
