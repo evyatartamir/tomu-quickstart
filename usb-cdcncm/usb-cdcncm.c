@@ -603,94 +603,92 @@ static void send_udp_debug(void)
     ncm_send_frame(udp_packet, len);
 }
 
-/* Send TCP SYN-ACK for port 80 with Timestamp echo (required by modern clients) */
-static void send_tcp_syn_ack(uint8_t *incoming_eth, uint32_t client_seq)
+/* Generic TCP packet sender */
+static void send_tcp_packet(uint8_t *incoming_eth,
+                            uint32_t client_seq,
+							uint32_t client_ack,
+                            uint8_t tcp_flags,
+                            bool include_timestamp)
 {
-	// TODO: Can we use the global TCP packet buffer? Since we only send one TCP packet at a time.
-    uint8_t sync_ack_packet[66];   // 14 (Ethernet) + 20 (IP) + 20 (TCP base) + 12 (TCP options)
+    uint8_t packet[66];
     uint16_t len = 0;
 
-    /* Ethernet header — swap MACs */
-    memcpy(sync_ack_packet + len, incoming_eth + 6, 6); len += 6;
-    memcpy(sync_ack_packet + len, g_server_mac_address, 6); len += 6;
-    sync_ack_packet[len++] = 0x08; sync_ack_packet[len++] = 0x00; /* IPv4 */
+    /* Ethernet */
+    memcpy(packet + len, incoming_eth + 6, 6); len += 6;
+    memcpy(packet + len, g_server_mac_address, 6); len += 6;
+    packet[len++] = 0x08; packet[len++] = 0x00;
 
-    /* IP header (20 bytes) */
+    /* IP */
     uint16_t ip_start = len;
-    sync_ack_packet[len++] = 0x45;
-    sync_ack_packet[len++] = 0x00;
-    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x34; /* total = 52 (20 IP + 32 TCP) */
-    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x06;
-    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00;
-    sync_ack_packet[len++] = 0x40; sync_ack_packet[len++] = 0x06;
-    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00;
-    memcpy(sync_ack_packet + len, g_server_ip_address, 4); len += 4;
-    memcpy(sync_ack_packet + len, incoming_eth + 14 + 12, 4); len += 4;
+    packet[len++] = 0x45; packet[len++] = 0x00;
+    packet[len++] = 0x00; packet[len++] = include_timestamp ? 0x34 : 0x28;
+    packet[len++] = 0x00; packet[len++] = 0x06;
+    packet[len++] = 0x00; packet[len++] = 0x00;
+    packet[len++] = 0x40; packet[len++] = 0x06;
+    packet[len++] = 0x00; packet[len++] = 0x00;
+    memcpy(packet + len, g_server_ip_address, 4); len += 4;
+    memcpy(packet + len, incoming_eth + 14 + 12, 4); len += 4;
 
-    /* TCP header base (20 bytes) + Timestamp option (12 bytes) = 32 bytes */
+    /* TCP */
     uint16_t tcp_start = len;
-    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x50; /* src port 80 */
-    sync_ack_packet[len++] = incoming_eth[34]; sync_ack_packet[len++] = incoming_eth[35]; /* dst port */
+    packet[len++] = 0x00; packet[len++] = 0x50;
+    packet[len++] = incoming_eth[34]; packet[len++] = incoming_eth[35];
 
-    /* Our seq (fixed for demo) */
-    static uint32_t our_seq = 0x12345678;
-    sync_ack_packet[len++] = (our_seq >> 24) & 0xFF;
-    sync_ack_packet[len++] = (our_seq >> 16) & 0xFF;
-    sync_ack_packet[len++] = (our_seq >> 8) & 0xFF;
-    sync_ack_packet[len++] = our_seq & 0xFF;
+    /* Sequence number */
+	uint32_t our_seq = include_timestamp ? 0x12345678 : client_ack;
+    packet[len++] = (our_seq >> 24) & 0xFF;
+    packet[len++] = (our_seq >> 16) & 0xFF;
+    packet[len++] = (our_seq >> 8) & 0xFF;
+    packet[len++] = our_seq & 0xFF;
 
-    /* Ack = client_seq + 1 */
+    /* Ack */
     uint32_t ack = client_seq + 1;
-    sync_ack_packet[len++] = (ack >> 24) & 0xFF;
-    sync_ack_packet[len++] = (ack >> 16) & 0xFF;
-    sync_ack_packet[len++] = (ack >> 8) & 0xFF;
-    sync_ack_packet[len++] = ack & 0xFF;
+    packet[len++] = (ack >> 24) & 0xFF;
+    packet[len++] = (ack >> 16) & 0xFF;
+    packet[len++] = (ack >> 8) & 0xFF;
+    packet[len++] = ack & 0xFF;
 
-    sync_ack_packet[len++] = 0x80; /* data offset = 32 bytes (8 << 4) */
-    sync_ack_packet[len++] = 0x12; /* SYN + ACK */
+    /* Data offset + flags */
+    packet[len++] = include_timestamp ? 0x80 : 0x50;
+    packet[len++] = tcp_flags;
 
-    sync_ack_packet[len++] = 0x16; sync_ack_packet[len++] = 0xD0; /* window = 5840 */
+    packet[len++] = 0x16; packet[len++] = 0xD0; /* window */
 
-    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00; /* checksum placeholder */
-    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00; /* urgent */
+    packet[len++] = 0x00; packet[len++] = 0x00; /* checksums */
+    packet[len++] = 0x00; packet[len++] = 0x00;
 
-    /* TCP options: NOP NOP Timestamp (kind=8, len=10) */
-    sync_ack_packet[len++] = 0x01; /* NOP */
-    sync_ack_packet[len++] = 0x01; /* NOP */
-    sync_ack_packet[len++] = 0x08; /* Timestamp */
-    sync_ack_packet[len++] = 0x0A; /* Length 10 */
+    /* Timestamp option (only for SYN+ACK) */
+    if (include_timestamp) {
+        packet[len++] = 0x01; packet[len++] = 0x01;
+        packet[len++] = 0x08; packet[len++] = 0x0A;
+        packet[len++] = 0x00; packet[len++] = 0x00; packet[len++] = 0x00; packet[len++] = 0x00;
 
-    /* Server TSval (can be 0 or a counter) */
-    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00;
-
-    /* TSecr = echo client's TSval from the SYN (simple offset for common layout) */
-    uint32_t client_tsval = 0;
-    uint8_t *tcp_opts = incoming_eth + 14 + 20 + 20; /* after Eth + IP + TCP base */
-    if (tcp_opts[0] == 0x02 && tcp_opts[1] == 0x04 &&   /* MSS */
-        tcp_opts[4] == 0x04 && tcp_opts[5] == 0x02 &&   /* SACK */
-        tcp_opts[6] == 0x08 && tcp_opts[7] == 0x0A) {   /* Timestamp */
-        client_tsval = ((uint32_t)tcp_opts[8] << 24) |
-                       ((uint32_t)tcp_opts[9] << 16) |
-                       ((uint32_t)tcp_opts[10] << 8) |
-                       tcp_opts[11];
+        uint32_t client_tsval = 0;
+        uint8_t *opts = incoming_eth + 14 + 20 + 20;
+        if (opts[0] == 0x02 && opts[1] == 0x04 &&
+            opts[4] == 0x04 && opts[5] == 0x02 &&
+            opts[6] == 0x08 && opts[7] == 0x0A) {
+            client_tsval = ((uint32_t)opts[8] << 24) | ((uint32_t)opts[9] << 16) |
+                           ((uint32_t)opts[10] << 8) | opts[11];
+        }
+        packet[len++] = (client_tsval >> 24) & 0xFF;
+        packet[len++] = (client_tsval >> 16) & 0xFF;
+        packet[len++] = (client_tsval >> 8) & 0xFF;
+        packet[len++] = client_tsval & 0xFF;
     }
-    sync_ack_packet[len++] = (client_tsval >> 24) & 0xFF;
-    sync_ack_packet[len++] = (client_tsval >> 16) & 0xFF;
-    sync_ack_packet[len++] = (client_tsval >> 8) & 0xFF;
-    sync_ack_packet[len++] = client_tsval & 0xFF;
 
-    /* Fix IP checksum */
-    uint16_t ip_csum = internet_checksum(sync_ack_packet + ip_start, 20);
-    sync_ack_packet[ip_start + 10] = ip_csum & 0xFF;
-    sync_ack_packet[ip_start + 11] = (ip_csum >> 8) & 0xFF;
+    /* Checksums */
+    uint16_t ip_csum = internet_checksum(packet + ip_start, 20);
+    packet[ip_start + 10] = ip_csum & 0xFF;
+    packet[ip_start + 11] = (ip_csum >> 8) & 0xFF;
 
-    /* Fix TCP checksum (now 32 bytes header) */
-    uint16_t tcp_csum = tcp_checksum(sync_ack_packet + tcp_start, 32,
+    uint16_t tcp_len = len - tcp_start;
+    uint16_t tcp_csum = tcp_checksum(packet + tcp_start, tcp_len,
                                      g_server_ip_address, incoming_eth + 14 + 12);
-	sync_ack_packet[tcp_start + 16] = (tcp_csum >> 8) & 0xFF;  // high byte first (network order)
-	sync_ack_packet[tcp_start + 17] = tcp_csum & 0xFF;         // low byte second
+    packet[tcp_start + 16] = (tcp_csum >> 8) & 0xFF;
+    packet[tcp_start + 17] = tcp_csum & 0xFF;
 
-    ncm_send_frame(sync_ack_packet, len);
+    ncm_send_frame(packet, len);
 }
 
 static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint32_t client_ack, uint16_t payload_len)
@@ -919,8 +917,10 @@ static void ncm_parse_ntb(void)
 				uint16_t payload_len = frame_len - (14 + ip_header_len + tcp_hdr_len);
 
 				if (flags & 0x02) { /* SYN */
-					send_tcp_syn_ack(eth, seq);
-				} else if ((flags & 0x10) && payload_len > 4) { /* ACK + data */
+					send_tcp_packet(eth, seq, 0, 0x12, true); // Send SYN+ACK
+				} else if (flags & 0x01) { /* FIN (client wants to close) */
+            		send_tcp_packet(eth, seq, ack, 0x11, false); // Send FIN+ACK
+        		} else if ((flags & 0x10) && payload_len > 4) { /* ACK + data */
 					if (strncmp((char*)payload, "GET ", 4) == 0) {
 						send_http_response(eth, seq, ack, payload_len);
 					}
