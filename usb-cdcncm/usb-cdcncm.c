@@ -369,6 +369,12 @@ static bool udp_debug_enabled = true; // TODO
 static bool tcp_in_session = false;
 static uint32_t tcp_our_seq = 0x12345678;  /* Our initial sequence number */
 
+typedef enum {
+    HTTP_CONTENT_MAIN_PAGE,
+    HTTP_CONTENT_FAVICON,
+    // HTTP_CONTENT_JSON, etc. later
+} http_content_type_t;
+
 static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev, struct usb_setup_data *req, uint8_t **buf,
 		uint16_t *len, void (**complete)(usbd_device *usbd_dev, struct usb_setup_data *req))
 {
@@ -691,6 +697,65 @@ static void send_tcp_packet(uint8_t *incoming_eth,
     ncm_send_frame(packet, len);
 }
 
+/* Builds HTTP header + body into buf.
+ * Returns the number of bytes written for the HTTP content. */
+static uint16_t build_http_content(http_content_type_t type, uint8_t *buf)
+{
+    uint16_t len = 0;
+
+    if (type == HTTP_CONTENT_MAIN_PAGE) {
+        /* Write header up to Content-Length: */
+        strcpy((char*)buf + len, 
+               "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: ");
+        len += strlen((char*)buf + len);
+
+        uint16_t content_length_value_pos = len;   // where the number will go
+
+        /* Build body right after */
+        uint16_t body_start = len;
+
+        /* HTML body */
+        strcpy((char*)buf + len, "<html><body style='font-family:monospace;background:#111;color:#0f0'>"); len += strlen((char*)buf + len);
+        strcpy((char*)buf + len, "<h1>Tomu NCM</h1>"); len += strlen((char*)buf + len);
+        strcpy((char*)buf + len, "<p>rx="); len += strlen((char*)buf + len);
+        itoa(rx_count, (char*)buf + len, 10); len += strlen((char*)buf + len);
+        strcpy((char*)buf + len, " tx="); len += strlen((char*)buf + len);
+        itoa(tx_count, (char*)buf + len, 10); len += strlen((char*)buf + len);
+        strcpy((char*)buf + len, "</p><p>Uptime: "); len += strlen((char*)buf + len);
+
+        uint32_t h = uptime_seconds / 3600, m = (uptime_seconds % 3600)/60, s = uptime_seconds % 60;
+        char tb[16];
+        itoa(h, tb, 10); strcpy((char*)buf + len, tb); len += strlen(tb);
+        strcpy((char*)buf + len, ":"); len += 1;
+        if (m < 10) { strcpy((char*)buf + len, "0"); len += 1; }
+        itoa(m, tb, 10); strcpy((char*)buf + len, tb); len += strlen(tb);
+        strcpy((char*)buf + len, ":"); len += 1;
+        if (s < 10) { strcpy((char*)buf + len, "0"); len += 1; }
+        itoa(s, tb, 10); strcpy((char*)buf + len, tb); len += strlen(tb);
+
+        strcpy((char*)buf + len, "</p><p><small>USB CDC-NCM on EFM32HG309</small></p></body></html>");
+        len += strlen((char*)buf + len);
+
+        uint16_t body_len = len - body_start;
+
+        /* Shift body to make room for number + \r\n\r\n */
+        char clen[16];
+        int num_len = strlen(itoa(body_len, clen, 10));
+        int shift = num_len + 4;
+
+        memmove(buf + body_start + shift, buf + body_start, body_len);
+
+        /* Write the number and terminator into the gap */
+        memcpy(buf + content_length_value_pos, clen, num_len);
+        memcpy(buf + content_length_value_pos + num_len, "\r\n\r\n", 4);
+
+        /* Update len to cover header + body */
+        len = content_length_value_pos + num_len + 4 + body_len;
+    }
+
+    return len;
+}
+
 static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint32_t client_ack, uint16_t payload_len)
 {
     (void)client_ack;
@@ -733,55 +798,9 @@ static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint3
     tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
     tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
 
-    /* === Build HTTP header + HTML === */
-
-	/* Write header up to Content-Length: */
-    strcpy((char*)tcp_packet + len, 
-           "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: ");
-    len += strlen((char*)tcp_packet + len);
-
-    uint16_t content_length_value_pos = len;   // where the number will go
-
-    /* Build body right after (we'll shift it later) */
-    uint16_t body_start = len;
-
-    /* HTML body */
-    strcpy((char*)tcp_packet + len, "<html><body style='font-family:monospace;background:#111;color:#0f0'>"); len += strlen((char*)tcp_packet + len);
-    strcpy((char*)tcp_packet + len, "<h1>Tomu NCM</h1>"); len += strlen((char*)tcp_packet + len);
-    strcpy((char*)tcp_packet + len, "<p>rx="); len += strlen((char*)tcp_packet + len);
-    itoa(rx_count, (char*)tcp_packet + len, 10); len += strlen((char*)tcp_packet + len);
-    strcpy((char*)tcp_packet + len, " tx="); len += strlen((char*)tcp_packet + len);
-    itoa(tx_count, (char*)tcp_packet + len, 10); len += strlen((char*)tcp_packet + len);
-    strcpy((char*)tcp_packet + len, "</p><p>Uptime: "); len += strlen((char*)tcp_packet + len);
-
-    uint32_t h = uptime_seconds / 3600, m = (uptime_seconds % 3600)/60, s = uptime_seconds % 60;
-    char tb[16];
-    itoa(h, tb, 10); strcpy((char*)tcp_packet + len, tb); len += strlen(tb);
-    strcpy((char*)tcp_packet + len, ":"); len += 1;
-    if (m < 10) { strcpy((char*)tcp_packet + len, "0"); len += 1; }
-    itoa(m, tb, 10); strcpy((char*)tcp_packet + len, tb); len += strlen(tb);
-    strcpy((char*)tcp_packet + len, ":"); len += 1;
-    if (s < 10) { strcpy((char*)tcp_packet + len, "0"); len += 1; }
-    itoa(s, tb, 10); strcpy((char*)tcp_packet + len, tb); len += strlen(tb);
-
-    strcpy((char*)tcp_packet + len, "</p><p><small>USB CDC-NCM on EFM32HG309</small></p></body></html>");
-    len += strlen((char*)tcp_packet + len);
-
-    uint16_t body_len = len - body_start;
-
-    /* === Shift body to make room for number + \r\n\r\n === */
-    char clen[16];
-    int num_len = strlen(itoa(body_len, clen, 10));     // how many digits
-    int shift = num_len + 4;                    // digits + "\r\n\r\n"
-
-    memmove(tcp_packet + body_start + shift, tcp_packet + body_start, body_len);
-
-    /* Write the number and terminator into the gap */
-    memcpy(tcp_packet + content_length_value_pos, clen, num_len);
-    memcpy(tcp_packet + content_length_value_pos + num_len, "\r\n\r\n", 4);
-
-    /* Update len to cover the full header + body */
-    len = content_length_value_pos + num_len + 4 + body_len;
+   	/* Build HTTP content directly into tcp_packet */
+    uint16_t http_len = build_http_content(HTTP_CONTENT_MAIN_PAGE, tcp_packet + len);
+    len += http_len;
 
     /* Fix IP length */
     uint16_t ip_total = len - ip_start;
