@@ -14,6 +14,7 @@
 #include <libopencm3/cm3/scb.h>
 #include <libopencm3/cm3/systick.h>
 #include <libopencm3/cm3/nvic.h>
+#include <libopencm3/cm3/cortex.h>
 #include <libopencm3/usb/usbd.h>
 #include <libopencm3/usb/cdc.h>
 #include <libopencm3/efm32/wdog.h>
@@ -87,7 +88,9 @@ TOBOOT_CONFIGURATION(0);
 #define CDC_NCM_DATA_INTERFACE_NUM 1
 
 #define MAX_ICMP_FRAME 128   // Plenty for normal pings (most are < 100 bytes total)
-#define MAX_TCP_FRAME 256   // For HTTP response
+#define MAX_TCP_FRAME 512   // Must contain HTTP response
+#define MAX_HTTP_RESPONSE 384
+#define MAX_HTML_BUF 256
 
 struct usb_cdc_notification_header {
 	uint8_t bmRequestType;
@@ -132,6 +135,15 @@ static usbd_device *g_usbd_dev = 0;
 // TODO: Rename to g_ ?
 static uint8_t ntb_rx_buf[600]; // TODO: Can it be reduced to 1542 from 2048? Consider alignment.
 static volatile uint16_t ntb_rx_len = 0; // TODO: should this be volatile?
+
+// Simple one-frame NTB-16
+// TODO: 2048 bytes matches our advertised dwNtbOutMaxSize, although we only used headers (12+16) + Ethernet frame (1514)
+// TODO: Perhaps this can be reduced to 1542 from 2048? Consider alignment.
+static uint8_t ntb_tx_buf[600];
+
+static char html_buf[MAX_HTML_BUF];
+static char http_response[MAX_HTTP_RESPONSE];
+static uint8_t tcp_packet[MAX_TCP_FRAME];
 
 static const struct usb_device_descriptor dev = {
 	.bLength = USB_DT_DEVICE_SIZE,
@@ -355,6 +367,9 @@ static uint8_t g_server_ip_address[4] = {192, 168, 7, 1};
 static uint32_t rx_count = 0, tx_count = 0;
 static uint32_t uptime_seconds = 0;
 
+static bool led_visualization = true;
+static bool udp_debug_enabled = true; // TODO
+
 /* Simple TCP connection state for single client */
 static bool tcp_in_session = false;
 static uint32_t tcp_our_seq = 0x12345678;  /* Our initial sequence number */
@@ -430,26 +445,6 @@ static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev,
 	return USBD_REQ_NOTSUPP;
 }
 
-//TODO: Might use these later
-/*
-static char nibble_to_hexchar(uint8_t nibble) {
-	if (nibble < 10) {
-		return (char) (nibble + '0');
-	} else if (nibble < 16) {
-		return (char) (nibble - 10 + 'A');
-	} else {
-		return 'X';
-	}
-}
-
-static void buf_to_hexstring(uint8_t* source, char* dest, unsigned int start_index, unsigned int end_index) {
-	for (unsigned int current_byte_index = start_index; current_byte_index <= end_index; ++current_byte_index) {
-		dest[(current_byte_index - start_index)*2] = nibble_to_hexchar(source[current_byte_index] >> 4); // MSB nibble
-		dest[(current_byte_index - start_index)*2 + 1] = nibble_to_hexchar(source[current_byte_index] & 0xF); // LSB nibble
-	}
-}
-*/
-
 /* Internet checksum (RFC 1071 / RFC 791)
  * Used for IPv4 header, ICMP, and (if needed later) UDP/TCP.
  * The caller must zero the checksum field before calling.
@@ -504,169 +499,174 @@ static void ncm_send_frame(const uint8_t *frame, uint16_t frame_len)
 {
     if (frame_len == 0 || frame_len > 1514) return;
 
-    // Simple one-frame NTB-16
-    // TODO: 2048 bytes matches our advertised dwNtbOutMaxSize, although we only used headers (12+16) + Ethernet frame (1514)
-	// TODO: Perhaps this can be reduced to 1542 from 2048? Consider alignment.
-	static uint8_t ntb_buf[600];
+	/* Temporarily disable interrupts to prevent reentrancy from systick/USB */
+    uint32_t mask = cm_mask_interrupts(1);
+
 	uint16_t ntb_len = 0;
 
     /* NTH16 - "NCMH" */
-    ntb_buf[ntb_len++] = 'N'; ntb_buf[ntb_len++] = 'C'; ntb_buf[ntb_len++] = 'M'; ntb_buf[ntb_len++] = 'H';
-    ntb_buf[ntb_len++] = 0x0C; ntb_buf[ntb_len++] = 0x00;  /* wHeaderLength */
-    ntb_buf[ntb_len++] = 0x00; ntb_buf[ntb_len++] = 0x00;  /* wSequence (we ignore) */ //TODO: Can we ignore?
-    ntb_buf[ntb_len++] = 0x00; ntb_buf[ntb_len++] = 0x00;  /* wBlockLength will be filled later */
-    ntb_buf[ntb_len++] = 0x0C; ntb_buf[ntb_len++] = 0x00;  /* wNdpIndex = 12 (right after NTH) */
+    ntb_tx_buf[ntb_len++] = 'N'; ntb_tx_buf[ntb_len++] = 'C'; ntb_tx_buf[ntb_len++] = 'M'; ntb_tx_buf[ntb_len++] = 'H';
+    ntb_tx_buf[ntb_len++] = 0x0C; ntb_tx_buf[ntb_len++] = 0x00;  /* wHeaderLength */
+    ntb_tx_buf[ntb_len++] = 0x00; ntb_tx_buf[ntb_len++] = 0x00;  /* wSequence (we ignore) */ //TODO: Can we ignore?
+    ntb_tx_buf[ntb_len++] = 0x00; ntb_tx_buf[ntb_len++] = 0x00;  /* wBlockLength will be filled later */
+    ntb_tx_buf[ntb_len++] = 0x0C; ntb_tx_buf[ntb_len++] = 0x00;  /* wNdpIndex = 12 (right after NTH) */
 
     /* NDP16 - "NCM0" */
-    ntb_buf[ntb_len++] = 'N'; ntb_buf[ntb_len++] = 'C'; ntb_buf[ntb_len++] = 'M'; ntb_buf[ntb_len++] = '0';
-    ntb_buf[ntb_len++] = 0x10; ntb_buf[ntb_len++] = 0x00;  /* wLength = 16 (one entry + zero) */
-    ntb_buf[ntb_len++] = 0x00; ntb_buf[ntb_len++] = 0x00;  /* wNextNdpIndex = 0 */
+    ntb_tx_buf[ntb_len++] = 'N'; ntb_tx_buf[ntb_len++] = 'C'; ntb_tx_buf[ntb_len++] = 'M'; ntb_tx_buf[ntb_len++] = '0';
+    ntb_tx_buf[ntb_len++] = 0x10; ntb_tx_buf[ntb_len++] = 0x00;  /* wLength = 16 (one entry + zero) */
+    ntb_tx_buf[ntb_len++] = 0x00; ntb_tx_buf[ntb_len++] = 0x00;  /* wNextNdpIndex = 0 */
     /* First datagram entry */
-    ntb_buf[ntb_len++] = 0x1C; ntb_buf[ntb_len++] = 0x00;  /* wDatagramIndex = 12+16 (after NTB+NDP) */
-    ntb_buf[ntb_len++] = frame_len & 0xFF;
-    ntb_buf[ntb_len++] = (frame_len >> 8) & 0xFF;          /* wDatagramLength */
+    ntb_tx_buf[ntb_len++] = 0x1C; ntb_tx_buf[ntb_len++] = 0x00;  /* wDatagramIndex = 12+16 (after NTB+NDP) */
+    ntb_tx_buf[ntb_len++] = frame_len & 0xFF;
+    ntb_tx_buf[ntb_len++] = (frame_len >> 8) & 0xFF;          /* wDatagramLength */
     /* Zero terminator */
-    ntb_buf[ntb_len++] = 0x00; ntb_buf[ntb_len++] = 0x00;
-    ntb_buf[ntb_len++] = 0x00; ntb_buf[ntb_len++] = 0x00;
+    ntb_tx_buf[ntb_len++] = 0x00; ntb_tx_buf[ntb_len++] = 0x00;
+    ntb_tx_buf[ntb_len++] = 0x00; ntb_tx_buf[ntb_len++] = 0x00;
 
     /* Copy the actual Ethernet frame */
-    memcpy(ntb_buf + ntb_len, frame, frame_len);
+    memcpy(ntb_tx_buf + ntb_len, frame, frame_len);
     ntb_len += frame_len;
 
     /* Fix wBlockLength in NTH */
-    ntb_buf[8] = ntb_len & 0xFF;
-    ntb_buf[9] = (ntb_len >> 8) & 0xFF;
+    ntb_tx_buf[8] = ntb_len & 0xFF;
+    ntb_tx_buf[9] = (ntb_len >> 8) & 0xFF;
 
     // Send in 64-byte chunks (required on full-speed USB)
 	uint16_t sent = 0;
 	while (sent < ntb_len) {
 		uint16_t chunk = (ntb_len - sent) > 64 ? 64 : (ntb_len - sent);
-		uint16_t return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_DATA_IN_EP, ntb_buf + sent, chunk);
+		uint16_t return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_DATA_IN_EP, ntb_tx_buf + sent, chunk);
 		while (!return_value) {
 			udelay_busy(EP_WRITE_RETRY_DELAY_USECS);
-			return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_DATA_IN_EP, ntb_buf + sent, chunk);
+			return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_DATA_IN_EP, ntb_tx_buf + sent, chunk);
 		}
 		sent += chunk;
 	}
 	
 	tx_count++;
-    gpio_toggle(LED_GREEN_PORT, LED_GREEN_PIN);  /* visual TX feedback */
+	if (led_visualization) {
+    	gpio_toggle(LED_GREEN_PORT, LED_GREEN_PIN); // Toggle Green LED for frame Tx
+	}
+    
+    /* Restore previous interrupt state */
+    cm_mask_interrupts(mask);
 }
 
 // UDP debug packet
 static void send_udp_debug(void)
 {
-	uint8_t packet[128];
+	uint8_t udp_packet[71]; // 42 bytes header + max payload
     uint16_t len = 0;
 
     /* Ethernet header (14 bytes) */
-    memcpy(packet + len, g_mac_address, 6);          len += 6;   // dst = Host NIC
-    memcpy(packet + len, g_server_mac_address, 6);   len += 6;   // src = Tomu (remote)
-    packet[len++] = 0x08; packet[len++] = 0x00;                 // EtherType = IPv4
+    memcpy(udp_packet + len, g_mac_address, 6);          len += 6;   // dst = Host NIC
+    memcpy(udp_packet + len, g_server_mac_address, 6);   len += 6;   // src = Tomu (remote)
+    udp_packet[len++] = 0x08; udp_packet[len++] = 0x00;                 // EtherType = IPv4
 
 	/* IPv4 header (20 bytes) */
     uint16_t ip_hdr_start = len;
-    packet[len++] = 0x45; packet[len++] = 0x00;
-    packet[len++] = 0x00; packet[len++] = 0x00;   // total length (fix later)
-    packet[len++] = 0x00; packet[len++] = 0x01;   // Identification
-    packet[len++] = 0x00; packet[len++] = 0x00;   // Flags + Fragment Offset
-    packet[len++] = 0x40; packet[len++] = 0x11;   // TTL, protocol = UDP
-    packet[len++] = 0x00; packet[len++] = 0x00;   // checksum (zero for now)
-    memcpy(packet + len, g_server_ip_address, 4); len += 4;   // src IP
-    memcpy(packet + len, g_host_ip_address, 4);   len += 4;   // dst IP
+    udp_packet[len++] = 0x45; udp_packet[len++] = 0x00;
+    udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;   // total length (fix later)
+    udp_packet[len++] = 0x00; udp_packet[len++] = 0x01;   // Identification
+    udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;   // Flags + Fragment Offset
+    udp_packet[len++] = 0x40; udp_packet[len++] = 0x11;   // TTL, protocol = UDP
+    udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;   // checksum (zero for now)
+    memcpy(udp_packet + len, g_server_ip_address, 4); len += 4;   // src IP
+    memcpy(udp_packet + len, g_host_ip_address, 4);   len += 4;   // dst IP
 
 	/* UDP header (8 bytes) */
 	//TODO: Make destination port a constant define instead of hard-coded?
-    packet[len++] = 0x04; packet[len++] = 0xD2;                 // src port 1234
-    packet[len++] = 0x04; packet[len++] = 0xD2;                 // dst port 1234
-    packet[len++] = 0x00; packet[len++] = 0x00;                 // UDP Length (fix later)
-    packet[len++] = 0x00; packet[len++] = 0x00;                 // UDP checksum = 0 (allowed)
+    udp_packet[len++] = 0x04; udp_packet[len++] = 0xD2;                 // src port 1234
+    udp_packet[len++] = 0x04; udp_packet[len++] = 0xD2;                 // dst port 1234
+    udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;                 // UDP Length (fix later)
+    udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;                 // UDP checksum = 0 (allowed)
 
 	/* Payload */
     char status[16];
-    strcpy((char*)packet + len, "RX:"); len += 3;
+    strcpy((char*)udp_packet + len, "RX:"); len += 3;
     itoa(rx_count, status, 10);
-    strcpy((char*)packet + len, status); len += strlen(status);
-    strcpy((char*)packet + len, " TX:"); len += 4;
+    strcpy((char*)udp_packet + len, status); len += strlen(status);
+    strcpy((char*)udp_packet + len, " TX:"); len += 4;
     itoa(tx_count, status, 10);
-    strcpy((char*)packet + len, status); len += strlen(status);
-    packet[len++] = '\r'; packet[len++] = '\n';
+    strcpy((char*)udp_packet + len, status); len += strlen(status);
+    udp_packet[len++] = '\r'; udp_packet[len++] = '\n';
 
 	/* Fix lengths */
     uint16_t ip_total = len - 14; // Skip 14 bytes of Ethernet header
-    packet[16] = (ip_total >> 8) & 0xFF;
-    packet[17] = ip_total & 0xFF;
+    udp_packet[16] = (ip_total >> 8) & 0xFF;
+    udp_packet[17] = ip_total & 0xFF;
 
     uint16_t udp_len = len - 34;   // 14 (Eth) + 20 (IP)
-    packet[38] = (udp_len >> 8) & 0xFF;
-    packet[39] = udp_len & 0xFF;
+    udp_packet[38] = (udp_len >> 8) & 0xFF;
+    udp_packet[39] = udp_len & 0xFF;
 
 	/* Calculate and insert IPv4 header checksum */
-    uint16_t csum = internet_checksum(packet + ip_hdr_start, 20);
-    packet[ip_hdr_start + 10] = csum & 0xFF;
-    packet[ip_hdr_start + 11] = (csum >> 8) & 0xFF;
+    uint16_t csum = internet_checksum(udp_packet + ip_hdr_start, 20);
+    udp_packet[ip_hdr_start + 10] = csum & 0xFF;
+    udp_packet[ip_hdr_start + 11] = (csum >> 8) & 0xFF;
 
-    ncm_send_frame(packet, len);
+    ncm_send_frame(udp_packet, len);
 }
 
 /* Send TCP SYN-ACK for port 80 with Timestamp echo (required by modern clients) */
 static void send_tcp_syn_ack(uint8_t *incoming_eth, uint32_t client_seq)
 {
-    uint8_t packet[80];   // 54 (base) + 12 (options) + padding = safe
+	// TODO: Can we use the global TCP packet buffer? Since we only send one TCP packet at a time.
+    uint8_t sync_ack_packet[66];   // 14 (Ethernet) + 20 (IP) + 20 (TCP base) + 12 (TCP options)
     uint16_t len = 0;
 
     /* Ethernet header — swap MACs */
-    memcpy(packet + len, incoming_eth + 6, 6); len += 6;
-    memcpy(packet + len, g_server_mac_address, 6); len += 6;
-    packet[len++] = 0x08; packet[len++] = 0x00; /* IPv4 */
+    memcpy(sync_ack_packet + len, incoming_eth + 6, 6); len += 6;
+    memcpy(sync_ack_packet + len, g_server_mac_address, 6); len += 6;
+    sync_ack_packet[len++] = 0x08; sync_ack_packet[len++] = 0x00; /* IPv4 */
 
     /* IP header (20 bytes) */
     uint16_t ip_start = len;
-    packet[len++] = 0x45;
-    packet[len++] = 0x00;
-    packet[len++] = 0x00; packet[len++] = 0x34; /* total = 52 (20 IP + 32 TCP) */
-    packet[len++] = 0x00; packet[len++] = 0x06;
-    packet[len++] = 0x00; packet[len++] = 0x00;
-    packet[len++] = 0x40; packet[len++] = 0x06;
-    packet[len++] = 0x00; packet[len++] = 0x00;
-    memcpy(packet + len, g_server_ip_address, 4); len += 4;
-    memcpy(packet + len, incoming_eth + 14 + 12, 4); len += 4;
+    sync_ack_packet[len++] = 0x45;
+    sync_ack_packet[len++] = 0x00;
+    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x34; /* total = 52 (20 IP + 32 TCP) */
+    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x06;
+    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00;
+    sync_ack_packet[len++] = 0x40; sync_ack_packet[len++] = 0x06;
+    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00;
+    memcpy(sync_ack_packet + len, g_server_ip_address, 4); len += 4;
+    memcpy(sync_ack_packet + len, incoming_eth + 14 + 12, 4); len += 4;
 
     /* TCP header base (20 bytes) + Timestamp option (12 bytes) = 32 bytes */
     uint16_t tcp_start = len;
-    packet[len++] = 0x00; packet[len++] = 0x50; /* src port 80 */
-    packet[len++] = incoming_eth[34]; packet[len++] = incoming_eth[35]; /* dst port */
+    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x50; /* src port 80 */
+    sync_ack_packet[len++] = incoming_eth[34]; sync_ack_packet[len++] = incoming_eth[35]; /* dst port */
 
     /* Our seq (fixed for demo) */
     static uint32_t our_seq = 0x12345678;
-    packet[len++] = (our_seq >> 24) & 0xFF;
-    packet[len++] = (our_seq >> 16) & 0xFF;
-    packet[len++] = (our_seq >> 8) & 0xFF;
-    packet[len++] = our_seq & 0xFF;
+    sync_ack_packet[len++] = (our_seq >> 24) & 0xFF;
+    sync_ack_packet[len++] = (our_seq >> 16) & 0xFF;
+    sync_ack_packet[len++] = (our_seq >> 8) & 0xFF;
+    sync_ack_packet[len++] = our_seq & 0xFF;
 
     /* Ack = client_seq + 1 */
     uint32_t ack = client_seq + 1;
-    packet[len++] = (ack >> 24) & 0xFF;
-    packet[len++] = (ack >> 16) & 0xFF;
-    packet[len++] = (ack >> 8) & 0xFF;
-    packet[len++] = ack & 0xFF;
+    sync_ack_packet[len++] = (ack >> 24) & 0xFF;
+    sync_ack_packet[len++] = (ack >> 16) & 0xFF;
+    sync_ack_packet[len++] = (ack >> 8) & 0xFF;
+    sync_ack_packet[len++] = ack & 0xFF;
 
-    packet[len++] = 0x80; /* data offset = 32 bytes (8 << 4) */
-    packet[len++] = 0x12; /* SYN + ACK */
+    sync_ack_packet[len++] = 0x80; /* data offset = 32 bytes (8 << 4) */
+    sync_ack_packet[len++] = 0x12; /* SYN + ACK */
 
-    packet[len++] = 0x16; packet[len++] = 0xD0; /* window = 5840 */
+    sync_ack_packet[len++] = 0x16; sync_ack_packet[len++] = 0xD0; /* window = 5840 */
 
-    packet[len++] = 0x00; packet[len++] = 0x00; /* checksum placeholder */
-    packet[len++] = 0x00; packet[len++] = 0x00; /* urgent */
+    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00; /* checksum placeholder */
+    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00; /* urgent */
 
     /* TCP options: NOP NOP Timestamp (kind=8, len=10) */
-    packet[len++] = 0x01; /* NOP */
-    packet[len++] = 0x01; /* NOP */
-    packet[len++] = 0x08; /* Timestamp */
-    packet[len++] = 0x0A; /* Length 10 */
+    sync_ack_packet[len++] = 0x01; /* NOP */
+    sync_ack_packet[len++] = 0x01; /* NOP */
+    sync_ack_packet[len++] = 0x08; /* Timestamp */
+    sync_ack_packet[len++] = 0x0A; /* Length 10 */
 
     /* Server TSval (can be 0 or a counter) */
-    packet[len++] = 0x00; packet[len++] = 0x00; packet[len++] = 0x00; packet[len++] = 0x00;
+    sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00; sync_ack_packet[len++] = 0x00;
 
     /* TSecr = echo client's TSval from the SYN (simple offset for common layout) */
     uint32_t client_tsval = 0;
@@ -679,23 +679,23 @@ static void send_tcp_syn_ack(uint8_t *incoming_eth, uint32_t client_seq)
                        ((uint32_t)tcp_opts[10] << 8) |
                        tcp_opts[11];
     }
-    packet[len++] = (client_tsval >> 24) & 0xFF;
-    packet[len++] = (client_tsval >> 16) & 0xFF;
-    packet[len++] = (client_tsval >> 8) & 0xFF;
-    packet[len++] = client_tsval & 0xFF;
+    sync_ack_packet[len++] = (client_tsval >> 24) & 0xFF;
+    sync_ack_packet[len++] = (client_tsval >> 16) & 0xFF;
+    sync_ack_packet[len++] = (client_tsval >> 8) & 0xFF;
+    sync_ack_packet[len++] = client_tsval & 0xFF;
 
     /* Fix IP checksum */
-    uint16_t ip_csum = internet_checksum(packet + ip_start, 20);
-    packet[ip_start + 10] = ip_csum & 0xFF;
-    packet[ip_start + 11] = (ip_csum >> 8) & 0xFF;
+    uint16_t ip_csum = internet_checksum(sync_ack_packet + ip_start, 20);
+    sync_ack_packet[ip_start + 10] = ip_csum & 0xFF;
+    sync_ack_packet[ip_start + 11] = (ip_csum >> 8) & 0xFF;
 
     /* Fix TCP checksum (now 32 bytes header) */
-    uint16_t tcp_csum = tcp_checksum(packet + tcp_start, 32,
+    uint16_t tcp_csum = tcp_checksum(sync_ack_packet + tcp_start, 32,
                                      g_server_ip_address, incoming_eth + 14 + 12);
-	packet[tcp_start + 16] = (tcp_csum >> 8) & 0xFF;  // high byte first (network order)
-	packet[tcp_start + 17] = tcp_csum & 0xFF;         // low byte second
+	sync_ack_packet[tcp_start + 16] = (tcp_csum >> 8) & 0xFF;  // high byte first (network order)
+	sync_ack_packet[tcp_start + 17] = tcp_csum & 0xFF;         // low byte second
 
-    ncm_send_frame(packet, len);
+    ncm_send_frame(sync_ack_packet, len);
 }
 
 /* Send HTTP response with live rx/tx counters (manual string build to save ROM) */
@@ -703,20 +703,18 @@ static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint3
 {
     (void)client_ack;
 
-    uint8_t packet[MAX_TCP_FRAME];
     uint16_t len = 0;
 
     /* Build dynamic HTML manually (same style as send_udp_debug) */
-    char html[160];          // plenty for this page
     uint16_t hlen = 0;
 
-	strcpy(html + hlen, "<html><body style='font-family:monospace;background:#111;color:#0f0'>"); hlen += strlen(html + hlen);
-	strcpy(html + hlen, "<h1>Tomu NCM</h1>"); hlen += strlen(html + hlen);
-	strcpy(html + hlen, "<p>rx="); hlen += strlen(html + hlen);
-	itoa(rx_count, html + hlen, 10); hlen += strlen(html + hlen);
-	strcpy(html + hlen, " tx="); hlen += strlen(html + hlen);
-	itoa(tx_count, html + hlen, 10); hlen += strlen(html + hlen);
-	strcpy(html + hlen, "</p><p>Uptime: "); hlen += strlen(html + hlen);
+	strcpy(html_buf + hlen, "<html><body style='font-family:monospace;background:#111;color:#0f0'>"); hlen += strlen(html_buf + hlen);
+	strcpy(html_buf + hlen, "<h1>Tomu NCM</h1>"); hlen += strlen(html_buf + hlen);
+	strcpy(html_buf + hlen, "<p>rx="); hlen += strlen(html_buf + hlen);
+	itoa(rx_count, html_buf + hlen, 10); hlen += strlen(html_buf + hlen);
+	strcpy(html_buf + hlen, " tx="); hlen += strlen(html_buf + hlen);
+	itoa(tx_count, html_buf + hlen, 10); hlen += strlen(html_buf + hlen);
+	strcpy(html_buf + hlen, "</p><p>Uptime: "); hlen += strlen(html_buf + hlen);
 
 	/* Format uptime as HH:MM:SS */
 	uint32_t h = uptime_seconds / 3600;
@@ -724,85 +722,84 @@ static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint3
 	uint32_t s = uptime_seconds % 60;
 
 	char timebuf[16];
-	itoa(h, timebuf, 10); strcpy(html + hlen, timebuf); hlen += strlen(timebuf);
-	strcpy(html + hlen, ":"); hlen += 1;
-	if (m < 10) { strcpy(html + hlen, "0"); hlen += 1; }
-	itoa(m, timebuf, 10); strcpy(html + hlen, timebuf); hlen += strlen(timebuf);
-	strcpy(html + hlen, ":"); hlen += 1;
-	if (s < 10) { strcpy(html + hlen, "0"); hlen += 1; }
-	itoa(s, timebuf, 10); strcpy(html + hlen, timebuf); hlen += strlen(timebuf);
+	itoa(h, timebuf, 10); strcpy(html_buf + hlen, timebuf); hlen += strlen(timebuf);
+	strcpy(html_buf + hlen, ":"); hlen += 1;
+	if (m < 10) { strcpy(html_buf + hlen, "0"); hlen += 1; }
+	itoa(m, timebuf, 10); strcpy(html_buf + hlen, timebuf); hlen += strlen(timebuf);
+	strcpy(html_buf + hlen, ":"); hlen += 1;
+	if (s < 10) { strcpy(html_buf + hlen, "0"); hlen += 1; }
+	itoa(s, timebuf, 10); strcpy(html_buf + hlen, timebuf); hlen += strlen(timebuf);
 
-	strcpy(html + hlen, "</p><p><small>USB CDC-NCM on EFM32HG309</small></p></body></html>"); hlen += strlen(html + hlen);
+	strcpy(html_buf + hlen, "</p><p><small>USB CDC-NCM on EFM32HG309</small></p></body></html>"); hlen += strlen(html_buf + hlen);
 
     /* Full HTTP response header + body */
-    char response[256];
     uint16_t rlen = 0;
 
-    strcpy(response + rlen, "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: "); rlen += strlen(response + rlen);
-    itoa(hlen, response + rlen, 10); rlen += strlen(response + rlen);
-    strcpy(response + rlen, "\r\n\r\n"); rlen += strlen(response + rlen);
-    memcpy(response + rlen, html, hlen); rlen += hlen;
+    strcpy(http_response + rlen, "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: "); rlen += strlen(http_response + rlen);
+    itoa(hlen, http_response + rlen, 10); rlen += strlen(http_response + rlen);
+    strcpy(http_response + rlen, "\r\n\r\n"); rlen += strlen(http_response + rlen);
+    memcpy(http_response + rlen, html_buf, hlen); rlen += hlen;
 
     uint16_t tcp_payload_len = rlen;
     uint16_t tcp_header_len = 20;
     uint16_t tcp_total = tcp_header_len + tcp_payload_len;
 
     /* Ethernet header */
-    memcpy(packet + len, incoming_eth + 6, 6); len += 6;
-    memcpy(packet + len, g_server_mac_address, 6); len += 6;
-    packet[len++] = 0x08; packet[len++] = 0x00; /* IPv4 */
+    memcpy(tcp_packet + len, incoming_eth + 6, 6); len += 6;
+    memcpy(tcp_packet + len, g_server_mac_address, 6); len += 6;
+    tcp_packet[len++] = 0x08; tcp_packet[len++] = 0x00; /* IPv4 */
 
     /* IP header */
     uint16_t ip_start = len;
-    packet[len++] = 0x45;
-    packet[len++] = 0x00;
-    packet[len++] = (20 + tcp_total) >> 8; packet[len++] = (20 + tcp_total) & 0xFF;
-    packet[len++] = 0x00; packet[len++] = 0x06;
-    packet[len++] = 0x00; packet[len++] = 0x00;
-    packet[len++] = 0x40; packet[len++] = 0x06;
-    packet[len++] = 0x00; packet[len++] = 0x00;
-    memcpy(packet + len, g_server_ip_address, 4); len += 4;
-    memcpy(packet + len, incoming_eth + 14 + 12, 4); len += 4;
+    tcp_packet[len++] = 0x45;
+    tcp_packet[len++] = 0x00;
+    tcp_packet[len++] = (20 + tcp_total) >> 8; tcp_packet[len++] = (20 + tcp_total) & 0xFF;
+    tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x06;
+    tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
+    tcp_packet[len++] = 0x40; tcp_packet[len++] = 0x06;
+    tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
+    memcpy(tcp_packet + len, g_server_ip_address, 4); len += 4;
+    memcpy(tcp_packet + len, incoming_eth + 14 + 12, 4); len += 4;
 
     /* TCP header (ACK + PSH + FIN) */
     uint16_t tcp_start = len;
-    packet[len++] = 0x00; packet[len++] = 0x50;
-    packet[len++] = incoming_eth[34]; packet[len++] = incoming_eth[35];
+    tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x50;
+    tcp_packet[len++] = incoming_eth[34]; tcp_packet[len++] = incoming_eth[35];
     uint32_t our_seq = tcp_our_seq + 1;
-    packet[len++] = (our_seq >> 24) & 0xFF;
-    packet[len++] = (our_seq >> 16) & 0xFF;
-    packet[len++] = (our_seq >> 8) & 0xFF;
-    packet[len++] = our_seq & 0xFF;
+    tcp_packet[len++] = (our_seq >> 24) & 0xFF;
+    tcp_packet[len++] = (our_seq >> 16) & 0xFF;
+    tcp_packet[len++] = (our_seq >> 8) & 0xFF;
+    tcp_packet[len++] = our_seq & 0xFF;
     uint32_t ack_val = client_seq + payload_len;
-    packet[len++] = (ack_val >> 24) & 0xFF;
-    packet[len++] = (ack_val >> 16) & 0xFF;
-    packet[len++] = (ack_val >> 8) & 0xFF;
-    packet[len++] = ack_val & 0xFF;
-    packet[len++] = 0x50;
-    packet[len++] = 0x19;
-    packet[len++] = 0x00; packet[len++] = 0x00;
-    packet[len++] = 0x00; packet[len++] = 0x00;
-    packet[len++] = 0x00; packet[len++] = 0x00;
+    tcp_packet[len++] = (ack_val >> 24) & 0xFF;
+    tcp_packet[len++] = (ack_val >> 16) & 0xFF;
+    tcp_packet[len++] = (ack_val >> 8) & 0xFF;
+    tcp_packet[len++] = ack_val & 0xFF;
+    tcp_packet[len++] = 0x50;
+    tcp_packet[len++] = 0x19;
+    tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
+    tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
+    tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
 
     /* Payload */
-    memcpy(packet + len, response, tcp_payload_len); len += tcp_payload_len;
+    memcpy(tcp_packet + len, http_response, tcp_payload_len); len += tcp_payload_len;
 
     /* Checksums */
-    uint16_t ip_csum = internet_checksum(packet + ip_start, 20);
-    packet[ip_start + 10] = ip_csum & 0xFF;
-    packet[ip_start + 11] = (ip_csum >> 8) & 0xFF;
+    uint16_t ip_csum = internet_checksum(tcp_packet + ip_start, 20);
+    tcp_packet[ip_start + 10] = ip_csum & 0xFF;
+    tcp_packet[ip_start + 11] = (ip_csum >> 8) & 0xFF;
 
-    uint16_t tcp_csum = tcp_checksum(packet + tcp_start, tcp_total,
+    uint16_t tcp_csum = tcp_checksum(tcp_packet + tcp_start, tcp_total,
                                      g_server_ip_address, incoming_eth + 14 + 12);
-    packet[tcp_start + 16] = (tcp_csum >> 8) & 0xFF;
-    packet[tcp_start + 17] = tcp_csum & 0xFF;
+    tcp_packet[tcp_start + 16] = (tcp_csum >> 8) & 0xFF;
+    tcp_packet[tcp_start + 17] = tcp_csum & 0xFF;
 
-    ncm_send_frame(packet, len);
+    ncm_send_frame(tcp_packet, len);
     tcp_in_session = false;
 }
 
 /* Minimal NTB-16 parser - called only when a complete NTB has been received */
-static void ncm_parse_and_echo_ntb(void)
+static void ncm_parse_ntb(void)
 {
 	if (ntb_rx_len < 12) {
 		goto reset;
@@ -835,8 +832,10 @@ static void ncm_parse_and_echo_ntb(void)
 
     // Valid Ethernet frame
 	rx_count++;
-	gpio_toggle(LED_RED_PORT, LED_RED_PIN); // Toggle Red LED for frame Rx
-
+	if (led_visualization) {
+    	gpio_toggle(LED_RED_PORT, LED_RED_PIN); // Toggle Red LED for frame Rx
+	}
+	
 	uint8_t *eth = &ntb_rx_buf[frame_offset];
     uint16_t eth_type = (eth[12] << 8) | eth[13];
 
@@ -941,7 +940,7 @@ static void cdcncm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 
     if (len == 0) {                     /* Zero-length packet = end of NTB */
         if (ntb_rx_len > 0) {
-            ncm_parse_and_echo_ntb();
+            ncm_parse_ntb();
         }
         return;
     }
@@ -957,7 +956,7 @@ static void cdcncm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 
     /* If this was a short packet (< 64 bytes), the NTB is complete */
     if (len < 64) {
-        ncm_parse_and_echo_ntb();
+        ncm_parse_ntb();
     }
 
 	return;
@@ -1023,11 +1022,9 @@ static void cdc_altsetting_cc(usbd_device *usbd_dev, uint16_t wIndex, uint16_t w
 
 	gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN);   // solid green = link up
 
+	// Reset counter, see also:	NCM 1.1 9.2 Using Alternate Settings to Reset an NCM Function
 	rx_count = 0;
 	tx_count = 0;
-
-	// TODO: Implement reset logic, as specified in NCM 1.1:
-	// 9.2 Using Alternate Settings to Reset an NCM Function
 
 	return;
 }
@@ -1071,8 +1068,6 @@ void hard_fault_handler(void)
 
 void sys_tick_handler(void)
 {	
-	// TODO: Service uIP timers
-
 	static uint16_t tick_counter = 0;
 
 	tick_counter++;
@@ -1082,7 +1077,7 @@ void sys_tick_handler(void)
         tick_counter = 0;
     }
 
-    if ((tick_counter == 0) && (uptime_seconds % 5 == 0)) {   // every 5 seconds
+    if ((tick_counter == 0) && (uptime_seconds % 5 == 0) && udp_debug_enabled) {   // every 5 seconds
         send_udp_debug();
     }
 }
