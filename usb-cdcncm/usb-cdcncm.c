@@ -93,7 +93,7 @@ TOBOOT_CONFIGURATION(0);
 #define NTB_BUF_SIZE 700 	// For Tx/Rx of packets
 
 #define MAX_ICMP_FRAME 128  // Plenty for normal pings (most are < 100 bytes total)
-#define MAX_TCP_FRAME 600   // Must contain HTTP response
+#define MAX_TCP_FRAME 640   // Contains HTTP response, must be smaller than (ntb_tx_buf - NCM headers), which is 28 bytes.
 
 struct usb_cdc_notification_header {
 	uint8_t bmRequestType;
@@ -140,7 +140,7 @@ static uint8_t ntb_rx_buf[NTB_BUF_SIZE];
 static volatile uint16_t ntb_rx_len = 0; // TODO: should this be volatile?
 
 static uint8_t ntb_tx_buf[NTB_BUF_SIZE];
-static uint8_t tcp_packet[MAX_TCP_FRAME]; // Must be smaller than ntb_tx_buf - NCM headers
+static uint8_t tcp_packet[MAX_TCP_FRAME];
 
 static const struct usb_device_descriptor dev = {
 	.bLength = USB_DT_DEVICE_SIZE,
@@ -723,8 +723,23 @@ static uint16_t build_http_content(http_content_type_t type, uint8_t *buf)
         itoa(rx_count, (char*)buf + len, 10); len += strlen((char*)buf + len);
         strcpy((char*)buf + len, " tx="); len += strlen((char*)buf + len);
         itoa(tx_count, (char*)buf + len, 10); len += strlen((char*)buf + len);
-        strcpy((char*)buf + len, "</p><p>Uptime: "); len += strlen((char*)buf + len);
+        
+		strcpy((char*)buf + len, "<form action='/' method='GET'>"); len += strlen((char*)buf + len);   
+  
+		strcpy((char*)buf + len, "<input type='hidden' name='led' value='0'>"); len += strlen((char*)buf + len);
+		strcpy((char*)buf + len, "<label><input type='checkbox' name='led' value='1'"); len += strlen((char*)buf + len);
+		if (led_visualization) { strcpy((char*)buf + len, " checked"); len += 8; }
+		strcpy((char*)buf + len, "> Rx/Tx LED</label>"); len += strlen((char*)buf + len);
+		
+		strcpy((char*)buf + len, "<input type='hidden' name='udp' value='0'>"); len += strlen((char*)buf + len);
+		strcpy((char*)buf + len, "<label><input type='checkbox' name='udp' value='1'"); len += strlen((char*)buf + len);
+		if (udp_debug_enabled) { strcpy((char*)buf + len, " checked"); len += 8; }
+		strcpy((char*)buf + len, "> UDP Stats</label>"); len += strlen((char*)buf + len);
 
+		strcpy((char*)buf + len, "<button type='submit'>Apply</button>"); len += strlen((char*)buf + len);
+		strcpy((char*)buf + len, "</form>"); len += strlen((char*)buf + len);
+
+		strcpy((char*)buf + len, "</p><p>Uptime: "); len += strlen((char*)buf + len);
         uint32_t h = uptime_seconds / 3600, m = (uptime_seconds % 3600)/60, s = uptime_seconds % 60;
         char tb[16];
         itoa(h, tb, 10); strcpy((char*)buf + len, tb); len += strlen(tb);
@@ -980,18 +995,33 @@ static void ncm_parse_ntb(void)
 					if (strncmp((char*)payload, "GET /favicon", 12) == 0) {
     					send_http_response(eth, seq, ack, payload_len, HTTP_CONTENT_FAVICON_PNG);
 					} else if (strncmp((char*)payload, "GET /", 5) == 0) {
-						// Parse query parameters (very simple parser)
-						char *query = strstr((char*)payload, "?");
+						// Parse query parameters (very simple parser, assumes parameter order)
+						char *query = strstr((char*)payload, "?");			
 						if (query) {
-							if (strstr(query, "led=1"))  led_visualization = true;
-							if (strstr(query, "led=0")) {
-								led_visualization = false;
-								gpio_set(LED_RED_PORT, LED_RED_PIN); // Turn off red LED
-								gpio_set(LED_GREEN_PORT, LED_GREEN_PIN); // Turn off green LED
+							// Find the end of the query string (before " HTTP" or \r)
+							// Done to avoid parsing values in "Referer" field
+							char *query_end = strstr(query, " HTTP");
+							if (!query_end) query_end = strstr(query, "\r");
+							
+							if (query_end) {
+								char saved = *query_end;
+								*query_end = '\0';   // temporarily terminate the query string
+
+								// Now safely parse only the query parameters
+								if (strstr(query, "led=0")) led_visualization = false;
+								if (strstr(query, "led=1")) led_visualization = true;
+								if (strstr(query, "udp=0")) udp_debug_enabled = false;
+								if (strstr(query, "udp=1")) udp_debug_enabled = true;
+
+								*query_end = saved;  // restore original character
 							}
-							if (strstr(query, "udp=1"))  udp_debug_enabled = true;
-							if (strstr(query, "udp=0"))  udp_debug_enabled = false;
 						}
+
+						if (!led_visualization) {
+							gpio_set(LED_RED_PORT, LED_RED_PIN); // Turn off red LED
+							gpio_set(LED_GREEN_PORT, LED_GREEN_PIN); // Turn off green LED
+						}
+						
 						send_http_response(eth, seq, ack, payload_len, HTTP_CONTENT_MAIN_PAGE);
 					}
 				}
