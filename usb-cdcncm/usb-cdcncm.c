@@ -88,12 +88,12 @@ TOBOOT_CONFIGURATION(0);
 #define CDC_NCM_DATA_INTERFACE_NUM 1
 
 // Simple one-frame NTB-16
-// TODO: 2048 bytes matches our advertised dwNtbOutMaxSize, although we only used headers (12+16) + Ethernet frame (1514)
-// TODO: Perhaps this can be reduced to 1542 from 2048? Consider alignment.
-#define NTB_BUF_SIZE 700 	// For Tx/Rx of packets
+// 2048 bytes is our advertised dwNtbOutMaxSize, although we only require NCM headers (12+16) + Ethernet frame (1514) (disregarding alignment)
+// TODO: Currently allocating less, since no packets require more, and to save RAM.
+#define NTB_BUF_SIZE 900 	// For Tx/Rx of packets
 
 #define MAX_ICMP_FRAME 128  // Plenty for normal pings (most are < 100 bytes total)
-#define MAX_TCP_FRAME 640   // Contains HTTP response, must be smaller than (ntb_tx_buf - NCM headers), which is 28 bytes.
+#define MAX_TCP_FRAME 850   // Contains HTTP response, must be smaller than (ntb_tx_buf - NCM headers), which is 28 bytes.
 
 struct usb_cdc_notification_header {
 	uint8_t bmRequestType;
@@ -134,10 +134,9 @@ struct usb_cdc_ncm_descriptor {
 
 static usbd_device *g_usbd_dev = 0;
 
-/* RX buffer for full NTB (one transfer) - matches our advertised dwNtbOutMaxSize */
-// TODO: Rename to g_ ?
+// RX buffer for full NTB (one transfer)
 static uint8_t ntb_rx_buf[NTB_BUF_SIZE];
-static volatile uint16_t ntb_rx_len = 0; // TODO: should this be volatile?
+static volatile uint16_t ntb_rx_len = 0;
 
 static uint8_t ntb_tx_buf[NTB_BUF_SIZE];
 static uint8_t tcp_packet[MAX_TCP_FRAME];
@@ -175,7 +174,7 @@ static const struct usb_endpoint_descriptor ncm_data_endp[] = {{
 	.bmAttributes = USB_ENDPOINT_ATTR_BULK,
 	.wMaxPacketSize = 64,
 	// .bInterval = 1,
-	.bInterval = 0 // TODO: Making it 0 like Blackberry
+	.bInterval = 0
 
 }, {
 	.bLength = USB_DT_ENDPOINT_SIZE,
@@ -184,7 +183,7 @@ static const struct usb_endpoint_descriptor ncm_data_endp[] = {{
 	.bmAttributes = USB_ENDPOINT_ATTR_BULK,
 	.wMaxPacketSize = 64,
 	// .bInterval = 1,
-	.bInterval = 0 // TODO: Making it 0 like Blackberry
+	.bInterval = 0
 }};
 
 // See: Table 6-1: NCM Communication Interface Descriptor Requirements
@@ -510,7 +509,7 @@ static void ncm_send_frame(const uint8_t *frame, uint16_t frame_len)
     /* NTH16 - "NCMH" */
     ntb_tx_buf[ntb_len++] = 'N'; ntb_tx_buf[ntb_len++] = 'C'; ntb_tx_buf[ntb_len++] = 'M'; ntb_tx_buf[ntb_len++] = 'H';
     ntb_tx_buf[ntb_len++] = 0x0C; ntb_tx_buf[ntb_len++] = 0x00;  /* wHeaderLength */
-    ntb_tx_buf[ntb_len++] = 0x00; ntb_tx_buf[ntb_len++] = 0x00;  /* wSequence (we ignore) */ //TODO: Can we ignore?
+    ntb_tx_buf[ntb_len++] = 0x00; ntb_tx_buf[ntb_len++] = 0x00;  /* wSequence ignored, assuming the host driver doesn't care */ 
     ntb_tx_buf[ntb_len++] = 0x00; ntb_tx_buf[ntb_len++] = 0x00;  /* wBlockLength will be filled later */
     ntb_tx_buf[ntb_len++] = 0x0C; ntb_tx_buf[ntb_len++] = 0x00;  /* wNdpIndex = 12 (right after NTH) */
 
@@ -578,7 +577,7 @@ static void send_udp_debug(void)
     memcpy(udp_packet + len, g_host_ip_address, 4);   len += 4;   // dst IP
 
 	/* UDP header (8 bytes) */
-	//TODO: Make destination port a constant define instead of hard-coded?
+	//TODO: Make destination port a constant define / uint16_t instead of hard-coded?
     udp_packet[len++] = 0x04; udp_packet[len++] = 0xD2;                 // src port 1234
     udp_packet[len++] = 0x04; udp_packet[len++] = 0xD2;                 // dst port 1234
     udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;                 // UDP Length (fix later)
@@ -726,17 +725,18 @@ static uint16_t build_http_content(http_content_type_t type, uint8_t *buf)
         
 		strcpy((char*)buf + len, "<form action='/' method='GET'>"); len += strlen((char*)buf + len);   
   
-		strcpy((char*)buf + len, "<input type='hidden' name='led' value='0'>"); len += strlen((char*)buf + len);
+		strcpy((char*)buf + len, "<p><input type='hidden' name='led' value='0'>"); len += strlen((char*)buf + len);
 		strcpy((char*)buf + len, "<label><input type='checkbox' name='led' value='1'"); len += strlen((char*)buf + len);
 		if (led_visualization) { strcpy((char*)buf + len, " checked"); len += 8; }
-		strcpy((char*)buf + len, "> Rx/Tx LED</label>"); len += strlen((char*)buf + len);
+		strcpy((char*)buf + len, "> Rx/Tx LED</label></p>"); len += strlen((char*)buf + len);
 		
-		strcpy((char*)buf + len, "<input type='hidden' name='udp' value='0'>"); len += strlen((char*)buf + len);
+		strcpy((char*)buf + len, "<p><input type='hidden' name='udp' value='0'>"); len += strlen((char*)buf + len);
 		strcpy((char*)buf + len, "<label><input type='checkbox' name='udp' value='1'"); len += strlen((char*)buf + len);
 		if (udp_debug_enabled) { strcpy((char*)buf + len, " checked"); len += 8; }
-		strcpy((char*)buf + len, "> UDP Stats</label>"); len += strlen((char*)buf + len);
+		strcpy((char*)buf + len, "> UDP Stats</label></p>"); len += strlen((char*)buf + len);
 
-		strcpy((char*)buf + len, "<button type='submit'>Apply</button>"); len += strlen((char*)buf + len);
+		strcpy((char*)buf + len, "<p><button type='submit' style='font-family:monospace; background:#222; color:#0f0; border:1px solid #0f0; \
+									padding:4px 14px; cursor:pointer;'>Apply</button></p>"); len += strlen((char*)buf + len);
 		strcpy((char*)buf + len, "</form>"); len += strlen((char*)buf + len);
 
 		strcpy((char*)buf + len, "</p><p>Uptime: "); len += strlen((char*)buf + len);
