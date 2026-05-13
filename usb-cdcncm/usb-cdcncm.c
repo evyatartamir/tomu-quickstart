@@ -87,8 +87,13 @@ TOBOOT_CONFIGURATION(0);
 #define CDC_NCM_COMM_INTERFACE_NUM 0
 #define CDC_NCM_DATA_INTERFACE_NUM 1
 
-#define MAX_ICMP_FRAME 128   // Plenty for normal pings (most are < 100 bytes total)
-#define MAX_TCP_FRAME 512   // Must contain HTTP response
+// Simple one-frame NTB-16
+// TODO: 2048 bytes matches our advertised dwNtbOutMaxSize, although we only used headers (12+16) + Ethernet frame (1514)
+// TODO: Perhaps this can be reduced to 1542 from 2048? Consider alignment.
+#define NTB_BUF_SIZE 700 	// For Tx/Rx of packets
+
+#define MAX_ICMP_FRAME 128  // Plenty for normal pings (most are < 100 bytes total)
+#define MAX_TCP_FRAME 600   // Must contain HTTP response
 
 struct usb_cdc_notification_header {
 	uint8_t bmRequestType;
@@ -131,13 +136,10 @@ static usbd_device *g_usbd_dev = 0;
 
 /* RX buffer for full NTB (one transfer) - matches our advertised dwNtbOutMaxSize */
 // TODO: Rename to g_ ?
-static uint8_t ntb_rx_buf[600]; // TODO: Can it be reduced to 1542 from 2048? Consider alignment.
+static uint8_t ntb_rx_buf[NTB_BUF_SIZE];
 static volatile uint16_t ntb_rx_len = 0; // TODO: should this be volatile?
 
-// Simple one-frame NTB-16
-// TODO: 2048 bytes matches our advertised dwNtbOutMaxSize, although we only used headers (12+16) + Ethernet frame (1514)
-// TODO: Perhaps this can be reduced to 1542 from 2048? Consider alignment.
-static uint8_t ntb_tx_buf[600];
+static uint8_t ntb_tx_buf[NTB_BUF_SIZE];
 static uint8_t tcp_packet[MAX_TCP_FRAME]; // Must be smaller than ntb_tx_buf - NCM headers
 
 static const struct usb_device_descriptor dev = {
@@ -362,8 +364,8 @@ static uint8_t g_server_ip_address[4] = {192, 168, 7, 1};
 static uint32_t rx_count = 0, tx_count = 0;
 static uint32_t uptime_seconds = 0;
 
-static bool led_visualization = true;
-static bool udp_debug_enabled = true; // TODO
+static volatile bool led_visualization = true;
+static volatile bool udp_debug_enabled = true;
 
 /* Simple TCP connection state for single client */
 static bool tcp_in_session = false;
@@ -977,7 +979,19 @@ static void ncm_parse_ntb(void)
         		} else if ((flags & 0x10) && payload_len > 4) { /* ACK + data */
 					if (strncmp((char*)payload, "GET /favicon", 12) == 0) {
     					send_http_response(eth, seq, ack, payload_len, HTTP_CONTENT_FAVICON_PNG);
-					} else if (strncmp((char*)payload, "GET ", 4) == 0) {
+					} else if (strncmp((char*)payload, "GET /", 5) == 0) {
+						// Parse query parameters (very simple parser)
+						char *query = strstr((char*)payload, "?");
+						if (query) {
+							if (strstr(query, "led=1"))  led_visualization = true;
+							if (strstr(query, "led=0")) {
+								led_visualization = false;
+								gpio_set(LED_RED_PORT, LED_RED_PIN); // Turn off red LED
+								gpio_set(LED_GREEN_PORT, LED_GREEN_PIN); // Turn off green LED
+							}
+							if (strstr(query, "udp=1"))  udp_debug_enabled = true;
+							if (strstr(query, "udp=0"))  udp_debug_enabled = false;
+						}
 						send_http_response(eth, seq, ack, payload_len, HTTP_CONTENT_MAIN_PAGE);
 					}
 				}
