@@ -90,10 +90,14 @@ TOBOOT_CONFIGURATION(0);
 // Simple one-frame NTB-16
 // 2048 bytes is our advertised dwNtbOutMaxSize, although we only require NCM headers (12+16) + Ethernet frame (1514) (disregarding alignment)
 // TODO: Currently allocating less, since no packets require more, and to save RAM.
-#define NTB_BUF_SIZE 900 	// For Tx/Rx of packets
+#define NTB_BUF_SIZE 1000 	// For Tx/Rx of packets
 
 #define MAX_ICMP_FRAME 128  // Plenty for normal pings (most are < 100 bytes total)
-#define MAX_TCP_FRAME 860   // Contains HTTP response, must be smaller than (ntb_tx_buf - NCM headers), which is 28 bytes.
+#define MAX_TCP_FRAME 960   // Contains HTTP response, must be smaller than (ntb_tx_buf - NCM headers), which is 28 bytes.
+
+#define UDP_SRC_PORT 1234
+#define UDP_DST_PORT 1234
+#define HTML_AUTO_REFRESH
 
 struct usb_cdc_notification_header {
 	uint8_t bmRequestType;
@@ -577,7 +581,7 @@ static void send_udp_debug(void)
     memcpy(udp_packet + len, g_host_ip_address, 4);   len += 4;   // dst IP
 
 	/* UDP header (8 bytes) */
-	//TODO: Make destination port a constant define / uint16_t instead of hard-coded?
+	// TODO: Extract bytes from UDP_SRC/DST_PORT macro
     udp_packet[len++] = 0x04; udp_packet[len++] = 0xD2;                 // src port 1234
     udp_packet[len++] = 0x04; udp_packet[len++] = 0xD2;                 // dst port 1234
     udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;                 // UDP Length (fix later)
@@ -717,7 +721,9 @@ static uint16_t build_http_content(http_content_type_t type, uint8_t *buf)
 
         /* HTML body */
         strcpy((char*)buf + len, "<html><body style='font-family:monospace;background:#111;color:#0f0'>"); len += strlen((char*)buf + len);
+		#ifdef HTML_AUTO_REFRESH
 		strcpy((char*)buf + len, "<meta http-equiv='refresh' content='5'>"); len += strlen((char*)buf + len);
+		#endif
         strcpy((char*)buf + len, "<h1>Tomu NCM</h1>"); len += strlen((char*)buf + len);
         
 		strcpy((char*)buf + len, "<p>rx="); len += strlen((char*)buf + len);
@@ -737,8 +743,9 @@ static uint16_t build_http_content(http_content_type_t type, uint8_t *buf)
 		if (udp_debug_enabled) { strcpy((char*)buf + len, " checked"); len += 8; }
 		strcpy((char*)buf + len, "> UDP Stats</label></p>"); len += strlen((char*)buf + len);
 
-		strcpy((char*)buf + len, "<p><button type='submit' style='font-family:monospace; background:#222; color:#0f0; border:1px solid #0f0; \
-									padding:4px 14px; cursor:pointer;'>Apply</button></p>"); len += strlen((char*)buf + len);
+		strcpy((char*)buf + len, "<p><button type='submit' style='font-family:monospace; background:#222; color:#0f0; border:1px solid #0f0; padding:4px 14px; cursor:pointer;'>Apply</button></p>");
+		len += strlen((char*)buf + len);
+		
 		strcpy((char*)buf + len, "</form>"); len += strlen((char*)buf + len);
 
 		strcpy((char*)buf + len, "</p><p>Uptime: "); len += strlen((char*)buf + len);
@@ -752,7 +759,7 @@ static uint16_t build_http_content(http_content_type_t type, uint8_t *buf)
         if (s < 10) { strcpy((char*)buf + len, "0"); len += 1; }
         itoa(s, tb, 10); strcpy((char*)buf + len, tb); len += strlen(tb);
 
-        strcpy((char*)buf + len, "</p><p><small>USB CDC-NCM on EFM32HG309</small></p></body></html>");
+        strcpy((char*)buf + len, "</p><p><small><a href='https://github.com/im-tomu/tomu-quickstart/tree/master/usb-cdcncm' style='color:#0f0;'>USB CDC-NCM on EFM32HG309</a></small></p></body></html>");
         len += strlen((char*)buf + len);
 
         uint16_t body_len = len - body_start;
