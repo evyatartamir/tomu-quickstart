@@ -93,7 +93,7 @@ TOBOOT_CONFIGURATION(0);
 #define NTB_BUF_SIZE 900 	// For Tx/Rx of packets
 
 #define MAX_ICMP_FRAME 128  // Plenty for normal pings (most are < 100 bytes total)
-#define MAX_TCP_FRAME 850   // Contains HTTP response, must be smaller than (ntb_tx_buf - NCM headers), which is 28 bytes.
+#define MAX_TCP_FRAME 860   // Contains HTTP response, must be smaller than (ntb_tx_buf - NCM headers), which is 28 bytes.
 
 struct usb_cdc_notification_header {
 	uint8_t bmRequestType;
@@ -717,8 +717,10 @@ static uint16_t build_http_content(http_content_type_t type, uint8_t *buf)
 
         /* HTML body */
         strcpy((char*)buf + len, "<html><body style='font-family:monospace;background:#111;color:#0f0'>"); len += strlen((char*)buf + len);
+		strcpy((char*)buf + len, "<meta http-equiv='refresh' content='5'>"); len += strlen((char*)buf + len);
         strcpy((char*)buf + len, "<h1>Tomu NCM</h1>"); len += strlen((char*)buf + len);
-        strcpy((char*)buf + len, "<p>rx="); len += strlen((char*)buf + len);
+        
+		strcpy((char*)buf + len, "<p>rx="); len += strlen((char*)buf + len);
         itoa(rx_count, (char*)buf + len, 10); len += strlen((char*)buf + len);
         strcpy((char*)buf + len, " tx="); len += strlen((char*)buf + len);
         itoa(tx_count, (char*)buf + len, 10); len += strlen((char*)buf + len);
