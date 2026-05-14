@@ -8,6 +8,7 @@
  * ICMP Echo (Ping) reply.
  * A UDP packet with Rx/Tx stats is regulary sent to the host (unless disabled).
  * An HTTP (over TCP/IP port 80) web server serves an HTML page + favicon icon.
+ * Unknown GET paths return a 404 page.
  * When a valid packet is recieved, the red LED is toggled (unless disabled).
  * When a packet is transmitted, the green LED is toggled (unless disabled).
  */
@@ -606,8 +607,8 @@ static void send_udp_debug(void)
 	udp_packet[len++] = (UDP_DST_PORT >> 8) & 0xFF;
 	udp_packet[len++] = UDP_DST_PORT & 0xFF;
 
-    udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;                 // UDP Length (fixed later)
-    udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;                 // UDP checksum = 0 (allowed)
+    udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;		// UDP Length (fixed later)
+    udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;		// UDP checksum = 0 (allowed)
 
 	/* Payload */
     char status[16];
@@ -838,7 +839,6 @@ static uint16_t build_http_content(http_content_type_t type, uint8_t *buf)
     	static const char page_404[] =
         "<html><body style='font-family:monospace;background:#111;color:#0f0'>"
 		"<pre>"
-        // "<pre style='color:#0f0; line-height:1; font-size:12px;'>"
 		"                 ###      404       \n"
 		"  404          ##:-*#               \n"
 		"               #######              \n"
@@ -943,7 +943,6 @@ static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint3
     ncm_send_frame(tcp_packet, len);
     tcp_in_session = false;
 }
-
 
 /* Minimal NTB-16 parser - called only when a complete NTB has been received */
 static void ncm_parse_ntb(void)
