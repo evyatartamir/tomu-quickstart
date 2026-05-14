@@ -92,11 +92,11 @@ TOBOOT_CONFIGURATION(0);
 
 // Simple one-frame NTB-16
 // 2048 bytes is our advertised dwNtbOutMaxSize, although we only require NCM headers (12+16) + Ethernet frame (1514) (disregarding alignment)
-// TODO: Currently allocating less, since no packets require more, and to save RAM.
+// Currently allocating less than maximum, enough for our largest sent packets, to save RAM.
+// Increase these values if larger packets are required.
 #define NTB_BUF_SIZE 1000 	// For Tx/Rx of packets
-
-#define MAX_ICMP_FRAME 128  // Plenty for normal pings (most are < 100 bytes total)
 #define MAX_TCP_FRAME 960   // Contains HTTP response, must be smaller than (ntb_tx_buf - NCM headers) == 28 bytes.
+#define MAX_ICMP_FRAME 128  // Plenty for normal pings (most are < 100 bytes total)
 
 #define UDP_SRC_PORT 1234
 #define UDP_DST_PORT 1234
@@ -588,11 +588,14 @@ static void send_udp_debug(void)
     memcpy(udp_packet + len, g_server_ip_address, 4); len += 4;   // src IP
     memcpy(udp_packet + len, g_host_ip_address, 4);   len += 4;   // dst IP
 
-	/* UDP header (8 bytes) */
-	// TODO: Extract bytes from UDP_SRC/DST_PORT macro
-    udp_packet[len++] = 0x04; udp_packet[len++] = 0xD2;                 // src port 1234
-    udp_packet[len++] = 0x04; udp_packet[len++] = 0xD2;                 // dst port 1234
-    udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;                 // UDP Length (fix later)
+	/* UDP header (8 bytes) */   	
+	udp_packet[len++] = (UDP_SRC_PORT >> 8) & 0xFF;
+	udp_packet[len++] = UDP_SRC_PORT & 0xFF;
+
+	udp_packet[len++] = (UDP_DST_PORT >> 8) & 0xFF;
+	udp_packet[len++] = UDP_DST_PORT & 0xFF;
+
+    udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;                 // UDP Length (fixed later)
     udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;                 // UDP checksum = 0 (allowed)
 
 	/* Payload */
