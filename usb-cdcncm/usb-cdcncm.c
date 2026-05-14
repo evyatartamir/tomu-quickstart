@@ -392,6 +392,7 @@ static uint16_t ip_id_counter = 0;
 typedef enum {
     HTTP_CONTENT_MAIN_PAGE,
     HTTP_CONTENT_FAVICON_PNG,
+	HTTP_CONTENT_404,
     // Add additional content types or pages here
 } http_content_type_t;
 
@@ -833,6 +834,45 @@ static uint16_t build_http_content(http_content_type_t type, uint8_t *buf)
 
 		memcpy(buf + len, favicon_data, sizeof(favicon_data));
 		len += sizeof(favicon_data);
+	} else if (type == HTTP_CONTENT_404) {
+    	static const char page_404[] =
+        "<html><body style='font-family:monospace;background:#111;color:#0f0'>"
+		"<pre>"
+        // "<pre style='color:#0f0; line-height:1; font-size:12px;'>"
+		"                 ###      404       \n"
+		"  404          ##:-*#               \n"
+		"               #######              \n"
+		"                 ##           ##***#\n"
+		"            ############      #*--+#\n"
+		"        ##*+=------====++*##  ######\n"
+		"        ##.:--------------##    ### \n"
+		"#####   ##.--+**+==+**=---##    ### \n"
+		"#=-=*#  ##:=+..... ....==-##    ### \n"
+		"######  ##-== :+*. .*+.==-##  ####  \n"
+		"  ##    ##-=+:.......:-+=-#######   \n"
+		"  ####  ##---=++++++++=---####      \n"
+		"    ######---------------=##        \n"
+		"       ###-------404-----=##    404 \n"
+		"        ##---------------=##        \n"
+		"        ####################        \n"
+		"  404       ####    #####           \n"
+		"           #*==*#  #*==*##          "
+        "</pre>"
+        "</body></html>";
+
+		strcpy((char*)buf + len, "HTTP/1.0 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: ");
+		len += strlen((char*)buf + len);
+
+		char clen[16];
+		itoa(sizeof(page_404) - 1, clen, 10);           // -1 because of the null terminator
+		strcpy((char*)buf + len, clen);
+		len += strlen(clen);
+
+		strcpy((char*)buf + len, "\r\n\r\n");
+		len += 4;
+
+		strcpy((char*)buf + len, page_404);
+		len += strlen(page_404);
 	}
 
     return len;
@@ -1025,34 +1065,39 @@ static void ncm_parse_ntb(void)
 					if (strncmp((char*)payload, "GET /favicon", 12) == 0) {
     					send_http_response(eth, seq, ack, payload_len, HTTP_CONTENT_FAVICON_PNG);
 					} else if (strncmp((char*)payload, "GET /", 5) == 0) {
-						// Parse query parameters (very simple parser, assumes parameter order)
-						char *query = strstr((char*)payload, "?");			
-						if (query) {
-							// Find the end of the query string (before " HTTP" or \r)
-							// Done to avoid parsing values in "Referer" field
-							char *query_end = strstr(query, " HTTP");
-							if (!query_end) query_end = strstr(query, "\r");
-							
-							if (query_end) {
-								char saved = *query_end;
-								*query_end = '\0';   // temporarily terminate the query string
+						char *path = (char*)payload + 5;   // skip "GET /"
+						if (path[0] == ' ' || path[0] == '?') {
+							// Parse query parameters (very simple parser, assumes parameter order)
+							char *query = strstr((char*)payload, "?");			
+							if (query) {
+								// Find the end of the query string (before " HTTP" or \r)
+								// Done to avoid parsing values in "Referer" field
+								char *query_end = strstr(query, " HTTP");
+								if (!query_end) query_end = strstr(query, "\r");
+								
+								if (query_end) {
+									char saved = *query_end;
+									*query_end = '\0';   // temporarily terminate the query string
 
-								// Now safely parse only the query parameters
-								if (strstr(query, "led=0")) led_visualization = false;
-								if (strstr(query, "led=1")) led_visualization = true;
-								if (strstr(query, "udp=0")) udp_debug_enabled = false;
-								if (strstr(query, "udp=1")) udp_debug_enabled = true;
+									// Now safely parse only the query parameters
+									if (strstr(query, "led=0")) led_visualization = false;
+									if (strstr(query, "led=1")) led_visualization = true;
+									if (strstr(query, "udp=0")) udp_debug_enabled = false;
+									if (strstr(query, "udp=1")) udp_debug_enabled = true;
 
-								*query_end = saved;  // restore original character
+									*query_end = saved;  // restore original character
+								}
 							}
-						}
 
-						if (!led_visualization) {
-							gpio_set(LED_RED_PORT, LED_RED_PIN); // Turn off red LED
-							gpio_set(LED_GREEN_PORT, LED_GREEN_PIN); // Turn off green LED
+							if (!led_visualization) {
+								gpio_set(LED_RED_PORT, LED_RED_PIN); // Turn off red LED
+								gpio_set(LED_GREEN_PORT, LED_GREEN_PIN); // Turn off green LED
+							}
+							
+							send_http_response(eth, seq, ack, payload_len, HTTP_CONTENT_MAIN_PAGE);
+						} else { // Unsupported "GET /" page.
+							send_http_response(eth, seq, ack, payload_len, HTTP_CONTENT_404);
 						}
-						
-						send_http_response(eth, seq, ack, payload_len, HTTP_CONTENT_MAIN_PAGE);
 					}
 				}
 			}
