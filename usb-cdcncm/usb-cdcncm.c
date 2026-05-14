@@ -361,7 +361,7 @@ static uint32_t g_ntb_in_max_size = 2048;
 static uint8_t g_mac_address[6] = {0x4C, 0xFC, 0xAA, 0x12, 0x3B, 0xEB};
 static uint8_t g_server_mac_address[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
 // Default IP addresses for host NIC and "remote server" we simulate.
-static uint8_t g_host_ip_address[4] = {192, 168, 7, 2};
+static uint8_t g_host_ip_address[4] = {192, 168, 7, 2}; // Used to send UDP stats packet
 static uint8_t g_server_ip_address[4] = {192, 168, 7, 1};
 
 static uint32_t rx_count = 0, tx_count = 0;
@@ -1158,18 +1158,11 @@ static void cdc_set_config(usbd_device *usbd_dev, uint16_t wValue)
 
 	// The specified callback will be called if (type == (bmRequestType & type_mask)).
 
-//TODO: Why is this done twice?
-
+	// IN/OUT control requests handled in the same callback function (no need for USB_REQ_TYPE_DIRECTION in mask)
 	usbd_register_control_callback(
 				usbd_dev,
 				USB_REQ_TYPE_CLASS | USB_REQ_TYPE_INTERFACE,
 				USB_REQ_TYPE_TYPE | USB_REQ_TYPE_RECIPIENT,
-				cdc_control_request);
-
-	usbd_register_control_callback(
-				usbd_dev,
-				USB_REQ_TYPE_IN | USB_REQ_TYPE_CLASS | USB_REQ_TYPE_INTERFACE,
-				USB_REQ_TYPE_DIRECTION | USB_REQ_TYPE_TYPE | USB_REQ_TYPE_RECIPIENT,
 				cdc_control_request);
 }
 
