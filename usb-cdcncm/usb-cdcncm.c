@@ -1,12 +1,15 @@
 /**
  * \addtogroup Examples
  *
- * This example implements a USB CDC-NCM device (Ethernet NIC)
- *
- * TODO: Edit this text
- * When data is recieved, it will toggle the green LED and echo the data.
- * The red LED is toggled constantly and a string is sent over USB every
- * time the LED changes state as a heartbeat.
+ * This example implements a USB CDC-NCM device (Ethernet NIC) + HTTP web server.
+ * The USB host OS (Windows/Linux etc.) can interact with this server, on the NIC network.
+ * The following protocols are implemented:
+ * ARP reply: sends the "server" MAC address matching its requested IP address.
+ * ICMP Echo (Ping) reply.
+ * A UDP packet with Rx/Tx stats is regulary sent to the host (unless disabled).
+ * An HTTP (over TCP/IP port 80) web server serves an HTML page + favicon icon.
+ * When a valid packet is recieved, the red LED is toggled (unless disabled).
+ * When a packet is transmitted, the green LED is toggled (unless disabled).
  */
 
 #include <libopencm3/cm3/common.h>
@@ -93,7 +96,7 @@ TOBOOT_CONFIGURATION(0);
 #define NTB_BUF_SIZE 1000 	// For Tx/Rx of packets
 
 #define MAX_ICMP_FRAME 128  // Plenty for normal pings (most are < 100 bytes total)
-#define MAX_TCP_FRAME 960   // Contains HTTP response, must be smaller than (ntb_tx_buf - NCM headers), which is 28 bytes.
+#define MAX_TCP_FRAME 960   // Contains HTTP response, must be smaller than (ntb_tx_buf - NCM headers) == 28 bytes.
 
 #define UDP_SRC_PORT 1234
 #define UDP_DST_PORT 1234
@@ -333,6 +336,15 @@ void udelay_busy(uint32_t usecs)
 	}
 }
 
+void write_packet_when_ready(usbd_device *usbd_dev, uint8_t addr, const void *buf, uint16_t len)
+{
+	uint16_t return_value = usbd_ep_write_packet(usbd_dev, addr, buf, len);
+	while (!return_value) {
+		udelay_busy(EP_WRITE_RETRY_DELAY_USECS);
+		return_value = usbd_ep_write_packet(usbd_dev, addr, buf, len);
+	}
+}
+
 /* Buffer to be used for control requests. */
 static uint8_t usbd_control_buffer[128];
 
@@ -377,7 +389,7 @@ static uint32_t tcp_our_seq = 0x12345678;  /* Our initial sequence number */
 typedef enum {
     HTTP_CONTENT_MAIN_PAGE,
     HTTP_CONTENT_FAVICON_PNG,
-    // HTTP_CONTENT_JSON, etc. later
+    // Add additional content types or pages here
 } http_content_type_t;
 
 static enum usbd_request_return_codes cdc_control_request(usbd_device *usbd_dev, struct usb_setup_data *req, uint8_t **buf,
@@ -541,11 +553,7 @@ static void ncm_send_frame(const uint8_t *frame, uint16_t frame_len)
 	uint16_t sent = 0;
 	while (sent < ntb_len) {
 		uint16_t chunk = (ntb_len - sent) > 64 ? 64 : (ntb_len - sent);
-		uint16_t return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_DATA_IN_EP, ntb_tx_buf + sent, chunk);
-		while (!return_value) {
-			udelay_busy(EP_WRITE_RETRY_DELAY_USECS);
-			return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_DATA_IN_EP, ntb_tx_buf + sent, chunk);
-		}
+		write_packet_when_ready(g_usbd_dev, CDC_NCM_DATA_IN_EP, ntb_tx_buf + sent, chunk);
 		sent += chunk;
 	}
 	
@@ -1096,9 +1104,6 @@ static void cdc_altsetting_cc(usbd_device *usbd_dev, uint16_t wIndex, uint16_t w
 	// NCM 1.1 9.1 Notification Sequencing
 	// NCM functions are required to send ConnectionSpeedChange and NetworkConnection notifications in a specific order. 
 
-	// Send a notification for ConnectionSpeedChange + NetworkConnection
-	uint16_t return_value;
-
 	// ConnectionSpeedChange - USB CDC document 6.3.3
 	struct usb_cdc_notification_speed_change speed = {
 		.notify_header = {
@@ -1112,14 +1117,7 @@ static void cdc_altsetting_cc(usbd_device *usbd_dev, uint16_t wIndex, uint16_t w
 		.ulbitrate = 10000000, // 10 Mbps
 	};
 
-	// TODO: Refactor enpoint writing to a function to avoid duplicating this loop
-
-	return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_NOTIFY_EP, &speed, sizeof(speed));
-	// The endpoint might be busy transmitting, wait a little and retry.
-	while (!return_value) {
-		udelay_busy(EP_WRITE_RETRY_DELAY_USECS);
-		return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_NOTIFY_EP, &speed, sizeof(speed));
-	}
+	write_packet_when_ready(g_usbd_dev, CDC_NCM_NOTIFY_EP, &speed, sizeof(speed));
 
 	// NetworkConnection - USB CDC document 6.3.1
 	struct usb_cdc_notification_header connection = {
@@ -1130,16 +1128,11 @@ static void cdc_altsetting_cc(usbd_device *usbd_dev, uint16_t wIndex, uint16_t w
 		.wLength = 0,
 	};
 
-	return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_NOTIFY_EP, &connection, sizeof(connection));
-	// The endpoint might be busy transmitting, wait a little and retry.
-	while (!return_value) {
-		udelay_busy(EP_WRITE_RETRY_DELAY_USECS);
-		return_value = usbd_ep_write_packet(g_usbd_dev, CDC_NCM_NOTIFY_EP, &connection, sizeof(connection));
-	}
+	write_packet_when_ready(g_usbd_dev, CDC_NCM_NOTIFY_EP, &connection, sizeof(connection));
 
-	gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN);   // solid green = link up
+	gpio_clear(LED_GREEN_PORT, LED_GREEN_PIN); // Solid green = link up
 
-	// Reset counter, see also:	NCM 1.1 9.2 Using Alternate Settings to Reset an NCM Function
+	// Reset counters, see also: NCM 1.1 9.2 Using Alternate Settings to Reset an NCM Function
 	rx_count = 0;
 	tx_count = 0;
 
