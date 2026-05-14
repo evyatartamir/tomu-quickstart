@@ -386,6 +386,9 @@ static volatile bool udp_debug_enabled = true;
 static bool tcp_in_session = false;
 static uint32_t tcp_our_seq = 0x12345678;  /* Our initial sequence number */
 
+// Not strictly required, since our packets never fragment, but for good measure (RFC 791) 
+static uint16_t ip_id_counter = 0;
+
 typedef enum {
     HTTP_CONTENT_MAIN_PAGE,
     HTTP_CONTENT_FAVICON_PNG,
@@ -512,6 +515,13 @@ static uint16_t tcp_checksum(const uint8_t *tcp_buf, uint16_t tcp_len,
     return ~sum;
 }
 
+// Write a unique number to the IP header Identification field
+static inline void write_ip_identification(uint8_t *buf, uint16_t *offset) {
+    buf[(*offset)++] = (ip_id_counter >> 8) & 0xFF;
+    buf[(*offset)++] = ip_id_counter & 0xFF;
+    ip_id_counter++;
+}
+
 /* Minimal NTB-16 TX helper - builds a one-frame NTB and sends it */
 static void ncm_send_frame(const uint8_t *frame, uint16_t frame_len)
 {
@@ -581,8 +591,8 @@ static void send_udp_debug(void)
     uint16_t ip_hdr_start = len;
     udp_packet[len++] = 0x45; udp_packet[len++] = 0x00;
     udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;   // total length (fix later)
-    udp_packet[len++] = 0x00; udp_packet[len++] = 0x01;   // Identification
-    udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;   // Flags + Fragment Offset
+	write_ip_identification(udp_packet, &len);    
+	udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;   // Flags + Fragment Offset
     udp_packet[len++] = 0x40; udp_packet[len++] = 0x11;   // TTL, protocol = UDP
     udp_packet[len++] = 0x00; udp_packet[len++] = 0x00;   // checksum (zero for now)
     memcpy(udp_packet + len, g_server_ip_address, 4); len += 4;   // src IP
@@ -644,7 +654,7 @@ static void send_tcp_packet(uint8_t *incoming_eth,
     uint16_t ip_start = len;
     packet[len++] = 0x45; packet[len++] = 0x00;
     packet[len++] = 0x00; packet[len++] = include_timestamp ? 0x34 : 0x28;
-    packet[len++] = 0x00; packet[len++] = 0x06;
+    write_ip_identification(packet, &len);
     packet[len++] = 0x00; packet[len++] = 0x00;
     packet[len++] = 0x40; packet[len++] = 0x06;
     packet[len++] = 0x00; packet[len++] = 0x00;
@@ -841,7 +851,7 @@ static void send_http_response(uint8_t *incoming_eth, uint32_t client_seq, uint3
     uint16_t ip_start = len;
     tcp_packet[len++] = 0x45; tcp_packet[len++] = 0x00;
     tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00; /* placeholder */
-    tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x06;
+    write_ip_identification(tcp_packet, &len);
     tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
     tcp_packet[len++] = 0x40; tcp_packet[len++] = 0x06;
     tcp_packet[len++] = 0x00; tcp_packet[len++] = 0x00;
